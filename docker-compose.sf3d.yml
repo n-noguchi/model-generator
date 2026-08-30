@@ -1,0 +1,7 @@
+# Use only for BACKEND_MODE=sf3d on a host with NVIDIA Container Toolkit.
+services:
+  sf3d-worker:
+    gpus: all
+    volumes:
+      - ./data:/data
+      - ./models/huggingface:/models/huggingface

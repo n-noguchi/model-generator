@@ -1,0 +1,11 @@
+data/
+models/
+__pycache__/
+.pytest_cache/
+node_modules/
+.vite/
+dist/
+*.tsbuildinfo
+*.pyc
+__pycache__/
+.env

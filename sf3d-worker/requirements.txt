@@ -1,0 +1,4 @@
+requests>=2.31
+pillow>=10.0
+trimesh>=4.0
+pytest>=8.0

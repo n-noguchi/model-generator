@@ -1,0 +1,30 @@
+import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
+import { useEffect, useState } from 'react';
+import { createRoot } from 'react-dom/client';
+import { Canvas } from '@react-three/fiber';
+import { OrbitControls, PerspectiveCamera } from '@react-three/drei';
+import './style.css';
+const api = '/api';
+const call = (p, o) => fetch(api + p, o).then(async (r) => { const v = await r.json(); if (!r.ok)
+    throw Error(v.detail || 'request failed'); return v; });
+function Viewer() { const [wire, setWire] = useState(false); return _jsxs(_Fragment, { children: [_jsxs("label", { children: [_jsx("input", { type: "checkbox", checked: wire, onChange: e => setWire(e.target.checked) }), " Wireframe"] }), _jsx("div", { className: "viewer", children: _jsxs(Canvas, { children: [_jsx(PerspectiveCamera, { makeDefault: true, position: [0, 1.2, 3] }), _jsx("ambientLight", { intensity: 1 }), _jsxs("mesh", { children: [_jsx("boxGeometry", { args: [1, 1.6, .5] }), _jsx("meshStandardMaterial", { color: "#b76d8f", wireframe: wire })] }), _jsx(OrbitControls, {})] }) })] }); }
+function App() {
+    const [projects, setProjects] = useState([]), [name, setName] = useState('character'), [project, setProject] = useState(), [input, setInput] = useState(), [original, setOriginal] = useState(), [run, setRun] = useState(), [selected, setSelected] = useState();
+    const refresh = () => call('/projects').then(setProjects);
+    useEffect(() => { void refresh(); }, []);
+    useEffect(() => { if (!run)
+        return; const x = setInterval(() => call('/runs/' + run.id).then(setRun), 1500); return () => clearInterval(x); }, [run?.id]);
+    const create = async () => { const p = await call('/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) }); setProject(p); void refresh(); };
+    const upload = async (f) => { const d = new FormData(); d.append('image', f); return (await call('/uploads', { method: 'POST', body: d })).path; };
+    const generate = async (confirmed = false) => { if (!project || !input)
+        return; const input_path = await upload(input), original_path = original ? await upload(original) : undefined; const r = await call('/runs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ project_id: project.id, input_path, original_path, background: '#FF00FF', tolerance: 48, confirm_warning: confirmed }) }); if (r.requires_confirmation) {
+        if (window.confirm(r.warning + ' 続行しますか？'))
+            void generate(true);
+    }
+    else
+        setRun(r); };
+    const candidates = run?.candidates || [];
+    return _jsxs("main", { children: [_jsx("h1", { children: "Person Image-to-3D" }), _jsxs("section", { children: [_jsx("h2", { children: "Project" }), _jsx("input", { value: name, onChange: e => setName(e.target.value) }), _jsx("button", { onClick: create, children: "\u65B0\u898F\u30D7\u30ED\u30B8\u30A7\u30AF\u30C8" }), _jsxs("select", { value: project?.id || '', onChange: e => setProject(projects.find(p => p.id === e.target.value)), children: [_jsx("option", { value: "", children: "\u9078\u629E" }), projects.map(p => _jsx("option", { value: p.id, children: p.name }, p.id))] })] }), _jsxs("section", { children: [_jsx("h2", { children: "Input" }), _jsxs("label", { children: ["\u80CC\u666F\u5358\u8272\u5316\u6E08\u307F PNG/JPEG ", _jsx("input", { type: "file", accept: "image/png,image/jpeg", onChange: e => setInput(e.target.files?.[0]) })] }), _jsxs("label", { children: ["Original (\u4EFB\u610F) ", _jsx("input", { type: "file", accept: "image/png,image/jpeg", onChange: e => setOriginal(e.target.files?.[0]) })] }), _jsx("button", { disabled: !project || !input, onClick: () => generate(), children: "3\u5019\u88DC\u3092\u751F\u6210" })] }), run && _jsxs(_Fragment, { children: [_jsxs("section", { children: [_jsx("h2", { children: "Progress" }), run.jobs.map((j) => _jsxs("p", { children: ["Candidate ", candidates.find(c => c.id === j.candidate_id)?.number, ": ", j.status, " ", j.progress, "%"] }, j.id))] }), _jsxs("section", { children: [_jsx("h2", { children: "Comparison" }), _jsx(Viewer, {}), _jsx("div", { className: "grid", children: candidates.map(c => _jsxs("article", { className: selected?.id === c.id ? 'selected' : '', children: [c.preview_path && _jsx("img", { src: api + '/files/' + c.preview_path }), _jsxs("h3", { children: ["Candidate ", c.number] }), _jsxs("p", { children: [c.status, " / score ", c.score ?? '-'] }), _jsx("button", { disabled: c.status !== 'completed', onClick: () => { setSelected(c); call('/candidates/' + c.id + '/select', { method: 'POST' }); }, children: "\u3053\u306E\u5019\u88DC\u3092\u4F7F\u3046" }), _jsx("button", { disabled: c.status !== 'completed', onClick: () => call('/candidates/' + c.id + '/evaluation', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ geometry: 4, texture: 4, overall: 4, verdict: 'accept', comment: '' }) }), children: "\u8A55\u4FA1: Accept" })] }, c.id)) }), _jsx("button", { onClick: () => call('/runs/' + run.id + '/candidates', { method: 'POST' }).then(() => call('/runs/' + run.id).then(setRun)), children: "\u5019\u88DC\u30921\u3064\u8FFD\u52A0" })] }), selected && _jsxs("section", { children: [_jsx("h2", { children: "Optimize / Export" }), _jsx("button", { onClick: () => call('/candidates/' + selected.id + '/optimize', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ triangles: 20000, texture_size: 2048, lod: false, collision: false }) }), children: "20,000 triangles\u3067\u6700\u9069\u5316" }), _jsx("button", { onClick: () => call('/candidates/' + selected.id + '/export?preset=Generic', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(['glb', 'fbx']) }), children: "GLB / FBX Export" })] }), _jsxs("section", { children: [_jsx("h2", { children: "Logs" }), _jsx("pre", { children: run.jobs.map((j) => j.log).join('\n') })] })] })] });
+}
+;
+createRoot(document.getElementById('root')).render(_jsx(App, {}));
