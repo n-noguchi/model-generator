@@ -5,3 +5,4 @@ services:
     volumes:
       - ./data:/data
       - ./models/huggingface:/models/huggingface
+      - ./models/rembg:/models/rembg:ro
