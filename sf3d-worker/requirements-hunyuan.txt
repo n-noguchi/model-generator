@@ -1,0 +1,16 @@
+# Installed only in /opt/hunyuan-venv. Keep SF3D's pinned Transformers intact.
+accelerate>=0.30,<2
+diffusers>=0.30,<0.33
+einops>=0.8,<1
+numpy>=1.26,<2
+omegaconf>=2.3,<3
+opencv-python-headless>=4.10,<4.12
+pygltflib>=1.16,<2
+pymeshlab>=2023.12,<2026
+pybind11>=2.12,<4
+safetensors>=0.4,<1
+scikit-image>=0.22,<0.25
+scipy>=1.10,<2
+transformers>=4.48,<4.50
+tqdm>=4.66,<5
+xatlas>=0.0.9,<1

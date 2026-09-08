@@ -95,25 +95,47 @@ class StableFast3DBackend(ImageTo3DBackend):
         if not torch.cuda.is_available(): raise RuntimeError("SF3D mode requires CUDA; use BACKEND_MODE=mock without a GPU")
         model=mesh=None
         try:
+            bake_resolution=payload.get("bake_resolution",512)
+            if bake_resolution not in (512,1024,2048):
+                raise RuntimeError(f"Unsupported bake resolution: {bake_resolution}")
             image,message=prepare_foreground(Image.open(src),payload)
             report(message)
+            report(f"テクスチャ生成解像度: {bake_resolution}px")
             image=resize_foreground(image,.85)
             image.save(out/"input-alpha.png")
             model=SF3D.from_pretrained("stabilityai/stable-fast-3d",config_name="config.yaml",weight_name="model.safetensors")
             model.to("cuda");model.eval()
             with torch.no_grad():
                 with torch.autocast(device_type="cuda",dtype=torch.bfloat16):
-                    mesh,_=model.run_image([image],bake_resolution=512,remesh="none",vertex_count=-1)
+                    mesh,_=model.run_image([image],bake_resolution=bake_resolution,remesh="none",vertex_count=-1)
             model_path=out/"mesh.glb";mesh.export(model_path,include_normals=True)
             preview=out/"preview.png";image.save(preview)
             return model_path,preview,0
         finally:
             del mesh, model
             if torch.cuda.is_available(): torch.cuda.empty_cache()
-def post(path,**kwargs): return requests.post(API+path,timeout=30,**kwargs)
+
+class ProductionImageTo3DBackend(ImageTo3DBackend):
+    """Keep legacy SF3D jobs working while opting explicit jobs into 4-view shape generation."""
+    def __init__(self):
+        self.sf3d=StableFast3DBackend()
+        self._hunyuan=None
+
+    def generate(self,payload,out,report=lambda _:None):
+        if payload.get("generation_mode", "sf3d") != "multiview":
+            return self.sf3d.generate(payload,out,report)
+        if self._hunyuan is None:
+            from hunyuan_backend import HunyuanMultiViewBackend
+            self._hunyuan=HunyuanMultiViewBackend(DATA,prepare_foreground)
+        return self._hunyuan.generate(payload,out,report)
+def post(path, **kwargs):
+    """Treat worker callback HTTP errors as failures, never as a completed job."""
+    response = requests.post(API + path, timeout=30, **kwargs)
+    response.raise_for_status()
+    return response
 def report_connection_error(error): print(f"API unavailable; retrying in 2 seconds: {error}",flush=True)
 def main():
-    backend=MockImageTo3DBackend() if os.getenv("BACKEND_MODE","mock")=="mock" else StableFast3DBackend()
+    backend=MockImageTo3DBackend() if os.getenv("BACKEND_MODE","mock")=="mock" else ProductionImageTo3DBackend()
     while True:
         try: job=post("/worker/jobs/claim?kind=generate").json()
         except (requests.RequestException, ValueError) as e:

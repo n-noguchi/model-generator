@@ -30,11 +30,12 @@ services:
       HUGGINGFACE_HUB_CACHE: /models/huggingface/hub
       HF_HUB_OFFLINE: "1"
       U2NET_HOME: /models/rembg
+      HUNYUAN_MODEL_DIR: /models/hunyuan3d-2mv
     depends_on:
       api: {condition: service_healthy}
     # Official SF3D source and dependencies are installed in the worker image.
     # Offline inference, but writable for Transformers' one-time cache migration.
-    volumes: [./data:/data, ./models/huggingface:/models/huggingface, ./models/rembg:/models/rembg:ro]
+    volumes: [./data:/data, ./models/huggingface:/models/huggingface, ./models/rembg:/models/rembg:ro, ./models/hunyuan3d-2mv:/models/hunyuan3d-2mv:ro]
   blender-worker:
     build: ./blender-worker
     environment: {API_BASE_URL: http://api:8000}

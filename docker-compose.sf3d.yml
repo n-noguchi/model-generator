@@ -6,3 +6,4 @@ services:
       - ./data:/data
       - ./models/huggingface:/models/huggingface
       - ./models/rembg:/models/rembg:ro
+      - ./models/hunyuan3d-2mv:/models/hunyuan3d-2mv:ro

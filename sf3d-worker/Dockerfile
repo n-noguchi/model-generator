@@ -7,9 +7,22 @@ WORKDIR /worker
 COPY sf3d-worker/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 ARG SF3D_REPOSITORY=https://github.com/Stability-AI/stable-fast-3d.git
+ARG HUNYUAN3D_REPOSITORY=https://github.com/Tencent-Hunyuan/Hunyuan3D-2.git
+ARG HUNYUAN3D_COMMIT=f8db63096c8282cb27354314d896feba5ba6ff8a
 RUN apt-get update && apt-get install -y --no-install-recommends git build-essential cmake ninja-build && rm -rf /var/lib/apt/lists/* \
     && git clone --depth 1 --recurse-submodules --shallow-submodules ${SF3D_REPOSITORY} /opt/stable-fast-3d \
     && pip install --no-cache-dir -U setuptools==69.5.1 wheel \
     && cd /opt/stable-fast-3d && pip install --no-cache-dir -r requirements.txt
-COPY sf3d-worker/worker.py .
+# pymeshlab (used by Hunyuan3D shape generation) loads OpenGL at import time,
+# even in this headless worker. Keep this separate so the costly SF3D layer
+# remains cached when only the Hunyuan runtime changes.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libegl1 libglib2.0-0 libgl1 libopengl0 libxext6 libxrender1 \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone ${HUNYUAN3D_REPOSITORY} /opt/hunyuan3d-2 \
+    && cd /opt/hunyuan3d-2 && git checkout ${HUNYUAN3D_COMMIT} \
+    && python -m venv --system-site-packages /opt/hunyuan-venv
+COPY sf3d-worker/requirements-hunyuan.txt /tmp/requirements-hunyuan.txt
+RUN /opt/hunyuan-venv/bin/pip install --no-cache-dir -r /tmp/requirements-hunyuan.txt
+COPY sf3d-worker/worker.py sf3d-worker/hunyuan_backend.py sf3d-worker/projection.py .
 CMD ["python", "worker.py"]
