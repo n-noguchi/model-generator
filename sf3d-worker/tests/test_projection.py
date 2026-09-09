@@ -8,7 +8,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 import projection
-from projection import _fill_unseen, _project, _sample_rgba, _view_axes, _zbuffer
+from projection import _fill_unseen, _portrait_front_authority, _project, _relaxed_front_visibility, _sample_rgba, _screen_extent, _smoothstep, _view_axes, _zbuffer
 
 
 def test_default_view_directions_are_distinct_and_y_up():
@@ -47,6 +47,56 @@ def test_front_axis_can_be_calibrated_to_negative_z():
     axes = _view_axes("-z")
     assert np.allclose(axes["front"][0], (0, 0, -1))
     assert np.allclose(axes["front"][1], (-1, 0, 0))
+
+
+def test_temple_blend_zone_is_continuous_and_keeps_central_face_unblended():
+    width = 1.0
+    positions = np.linspace(0.0, .30, 301, dtype=np.float32)
+    blend = _smoothstep(positions, width * .09, width * .18)
+    assert blend[0] == 0.0
+    assert blend[-1] == 1.0
+    assert np.all(np.diff(blend) >= 0.0)
+    # No ownership jump through eyes/nose; blending starts smoothly at temples.
+    assert np.max(np.diff(blend)) < .03
+
+
+def test_registration_does_not_change_geometry_depth_or_cross_axis_face_width():
+    bounds = np.array(((-1, -2, -3), (1, 2, 3)), dtype=float)
+    point = np.array(((.25, .3, .75),), dtype=float)
+    direction, right = _view_axes("+z")["front"]
+    _, baseline_depth = _project(point, direction, right, bounds, (0, 99, 0, 99), (100, 100))
+    registration = {"rows": np.array((0., 99.)), "center": np.array((62., 62.)),
+                    "predicted_center": np.array((50., 50.)), "scale": np.array((1.05, 1.05))}
+    _, aligned_depth = _project(point, direction, right, bounds, (0, 99, 0, 99), (100, 100), registration)
+    assert np.allclose(baseline_depth, aligned_depth)
+    assert _screen_extent(bounds, right) == 2.0
+    _, x_right = _view_axes("+x")["front"]
+    assert _screen_extent(bounds, x_right) == 6.0
+
+
+def test_portrait_authority_is_head_local_continuous_and_independent_of_normals():
+    head_bounds = np.array(((-1, 1.4, -1), (1, 2.2, 1)), dtype=float)
+    # 0, 45, 70, 90 degree locations around a +Z-facing head.
+    angles = np.radians((0, 45, 70, 90, 180))
+    points = np.column_stack((np.sin(angles) * .6, np.full(5, 1.8), np.cos(angles) * .6))
+    authority = _portrait_front_authority(points, head_bounds, np.array((0., 0., 1.)), np.array((1., 0., 0.)))
+    assert authority[0] == pytest.approx(1.0)
+    assert authority[1] == pytest.approx(1.0)
+    assert 0.0 < authority[2] < 1.0
+    assert authority[3] == pytest.approx(0.0)
+    assert authority[4] == pytest.approx(0.0)
+    assert np.all(np.diff(authority) <= 0.0)
+
+
+def test_relaxed_front_visibility_is_bounded_to_valid_front_face_samples():
+    depth = np.array((.94, .80, .94, .94, .94))
+    z = np.full(5, 1.0)
+    alpha = np.array((1., 1., .5, 1., 1.))
+    interior = np.full(5, 8.)
+    facing = np.array((.1, .1, .1, -.2, .1))
+    authority = np.array((1., 1., 1., 1., 0.))
+    allowed = _relaxed_front_visibility(depth, z, alpha, interior, facing, authority, .08)
+    assert allowed.tolist() == [True, False, False, False, False]
 
 
 def test_fill_unseen_does_not_cross_between_nearby_uv_charts():

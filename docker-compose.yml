@@ -4,7 +4,7 @@ services:
     environment:
       DATA_DIR: /data
       DATABASE_URL: sqlite:////data/modelgenerator.db
-      BACKEND_MODE: ${BACKEND_MODE:-mock}
+      BACKEND_MODE: sf3d
     volumes: [./data:/data]
     expose: ["8000"]
     healthcheck:
@@ -24,7 +24,7 @@ services:
       dockerfile: sf3d-worker/Dockerfile
     environment:
       API_BASE_URL: http://api:8000
-      BACKEND_MODE: ${BACKEND_MODE:-mock}
+      BACKEND_MODE: sf3d
       SF3D_DIR: /opt/stable-fast-3d
       HF_HOME: /models/huggingface
       HUGGINGFACE_HUB_CACHE: /models/huggingface/hub
@@ -36,6 +36,7 @@ services:
     # Official SF3D source and dependencies are installed in the worker image.
     # Offline inference, but writable for Transformers' one-time cache migration.
     volumes: [./data:/data, ./models/huggingface:/models/huggingface, ./models/rembg:/models/rembg:ro, ./models/hunyuan3d-2mv:/models/hunyuan3d-2mv:ro]
+    gpus: all
   blender-worker:
     build: ./blender-worker
     environment: {API_BASE_URL: http://api:8000}

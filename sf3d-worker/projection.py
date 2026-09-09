@@ -60,21 +60,80 @@ def _source_rgba(value: Image.Image | str | Path) -> np.ndarray:
 
 def _project(points: np.ndarray, direction: np.ndarray, screen_right: np.ndarray,
              mesh_bounds: np.ndarray, source_bounds: tuple[float, float, float, float],
-             shape: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
+             shape: tuple[int, int], registration: dict | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Orthographically project points, fitting each cut-out to the mesh extent."""
     h, w = shape
     sx0, sx1, sy0, sy1 = source_bounds
-    center = (mesh_bounds[0] + mesh_bounds[1]) * 0.5
+    mesh_center = (mesh_bounds[0] + mesh_bounds[1]) * 0.5
     extent = np.maximum(mesh_bounds[1] - mesh_bounds[0], 1e-6)
     # horizontal mesh span follows screen-right; vertical always follows Y.
-    horizontal = abs(screen_right[0]) * extent[0] + abs(screen_right[2]) * extent[2]
+    horizontal = _screen_extent(mesh_bounds, screen_right)
     vertical = extent[1]
-    u = np.dot(points - center, screen_right) / max(horizontal, 1e-6) + 0.5
-    v = 0.5 - (points[:, 1] - center[1]) / max(vertical, 1e-6)
+    u = np.dot(points - mesh_center, screen_right) / max(horizontal, 1e-6) + 0.5
+    v = 0.5 - (points[:, 1] - mesh_center[1]) / max(vertical, 1e-6)
     x = sx0 + u * max(sx1 - sx0, 1.0)
     y = sy0 + v * max(sy1 - sy0, 1.0)
-    depth = np.dot(points - center, direction)
+    # A global bounding-box fit is particularly visible where a profile image
+    # meets the front image.  Apply a deliberately small, row-wise correction
+    # derived from the two silhouettes.  It changes texture lookup only, never
+    # the generated mesh or its camera convention.
+    if registration is not None:
+        rows = registration["rows"]
+        source_center = np.interp(y, rows, registration["center"])
+        predicted = np.interp(y, rows, registration["predicted_center"])
+        scale = np.interp(y, rows, registration["scale"])
+        x = source_center + (x - predicted) * scale
+    depth = np.dot(points - mesh_center, direction)
     return np.stack((x, y), axis=1), depth
+
+
+def _screen_extent(mesh_bounds: np.ndarray, screen_right: np.ndarray) -> float:
+    """Mesh width along a view's image-horizontal axis."""
+    extent = np.maximum(mesh_bounds[1] - mesh_bounds[0], 1e-6)
+    return float(abs(screen_right[0]) * extent[0] + abs(screen_right[2]) * extent[2])
+
+
+def _profile(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Robust per-row silhouette centre and half-width, with gaps interpolated."""
+    h, _ = mask.shape
+    centre = np.full(h, np.nan, dtype=np.float32)
+    width = np.full(h, np.nan, dtype=np.float32)
+    for y in range(h):
+        xs = np.flatnonzero(mask[y])
+        if len(xs):
+            centre[y] = (xs[0] + xs[-1]) * .5
+            width[y] = max((xs[-1] - xs[0]) * .5, 1.0)
+    valid = np.isfinite(centre)
+    if valid.sum() < 4:
+        return np.full(h, mask.shape[1] * .5, dtype=np.float32), np.full(h, mask.shape[1] * .5, dtype=np.float32)
+    rows = np.arange(h)
+    centre = np.interp(rows, rows[valid], centre[valid]).astype(np.float32)
+    width = np.interp(rows, rows[valid], width[valid]).astype(np.float32)
+    try:
+        from scipy.ndimage import gaussian_filter1d
+        # Smooth enough to avoid copying hair/hand silhouette noise into the
+        # face texture, while retaining head/torso/leg transitions.
+        sigma = max(2.0, h / 70.0)
+        centre = gaussian_filter1d(centre, sigma).astype(np.float32)
+        width = gaussian_filter1d(width, sigma).astype(np.float32)
+    except ImportError:
+        pass
+    return centre, np.maximum(width, 1.0)
+
+
+def _silhouette_registration(zbuffer: np.ndarray, rgba: np.ndarray) -> dict:
+    """Fit a bounded smooth horizontal row warp from mesh to source silhouette."""
+    h, w = rgba.shape[:2]
+    predicted = np.asarray(Image.fromarray(np.isfinite(zbuffer)).resize((w, h), Image.Resampling.NEAREST), dtype=bool)
+    observed = rgba[..., 3] >= 250
+    pc, pw = _profile(predicted)
+    oc, ow = _profile(observed)
+    # Do not let an imperfect generated limb force an image-sized deformation.
+    shift = np.clip(oc - pc, -0.075 * w, 0.075 * w)
+    scale = np.clip(ow / np.maximum(pw, 1.0), .92, 1.08)
+    return {"rows": np.arange(h, dtype=np.float32), "center": pc + shift,
+            "predicted_center": pc, "scale": scale,
+            "mean_shift_px": float(np.mean(np.abs(shift))), "mean_scale": float(np.mean(scale))}
 
 
 def _sample_rgba(image: np.ndarray, xy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -113,15 +172,46 @@ def _sample_scalar(image: np.ndarray, xy: np.ndarray) -> np.ndarray:
     return value
 
 
+def _smoothstep(value: np.ndarray, edge0: float, edge1: float) -> np.ndarray:
+    """A continuous 0..1 transition, including at both end points."""
+    t = np.clip((value - edge0) / max(edge1 - edge0, 1e-8), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _portrait_front_authority(points: np.ndarray, head_bounds: np.ndarray,
+                              front_direction: np.ndarray, screen_right: np.ndarray) -> np.ndarray:
+    """Continuous front-photo authority over the *geometric* head front half.
+
+    Normals on a reconstructed face are noisy around the nose and cheeks.  A
+    normal threshold therefore creates isolated source islands.  Define this
+    zone from the head-local position instead: 0--55 degrees is front-owned,
+    then it smoothly hands over to the side photograph by 85 degrees.
+    """
+    center = (head_bounds[0] + head_bounds[1]) * .5
+    horizontal = np.abs((points - center) @ screen_right)
+    forward = (points - center) @ front_direction
+    angle = np.degrees(np.arctan2(horizontal, forward))
+    return 1.0 - _smoothstep(angle, 55.0, 85.0)
+
+
+def _relaxed_front_visibility(point_depth: np.ndarray, z_at_point: np.ndarray,
+                              alpha: np.ndarray, interior: np.ndarray,
+                              facing: np.ndarray, authority: np.ndarray,
+                              tolerance: float) -> np.ndarray:
+    """Allow a small, bounded front-camera occlusion tolerance on the face."""
+    return (authority > 0.0) & np.isfinite(z_at_point) & (point_depth >= z_at_point - tolerance) & \
+        (alpha >= .98) & (interior >= 3.0) & (facing > -.10)
+
+
 def _zbuffer(vertices: np.ndarray, faces: np.ndarray, direction: np.ndarray,
              screen_right: np.ndarray, bounds: np.ndarray,
              source_bounds: tuple[float, float, float, float], shape: tuple[int, int],
-             max_size: int = 768) -> tuple[np.ndarray, float, float]:
+             max_size: int = 768, registration: dict | None = None) -> tuple[np.ndarray, float, float]:
     """Small orthographic depth buffer.  It is intentionally CPU-only."""
     src_h, src_w = shape
     scale = min(1.0, max_size / max(src_h, src_w))
     h, w = max(2, round(src_h * scale)), max(2, round(src_w * scale))
-    xy, depth = _project(vertices, direction, screen_right, bounds, source_bounds, shape)
+    xy, depth = _project(vertices, direction, screen_right, bounds, source_bounds, shape, registration)
     xy *= scale
     z = np.full((h, w), -np.inf, dtype=np.float32)
     for tri in faces:
@@ -254,6 +344,63 @@ def _silhouette_iou(zbuffer: np.ndarray, rgba: np.ndarray) -> tuple[float, np.nd
     return iou, overlay
 
 
+def _estimate_color_gains(vertices: np.ndarray, normals: np.ndarray, faces: np.ndarray,
+                          bounds: np.ndarray, source: Mapping[str, np.ndarray], source_bounds: Mapping,
+                          interior_distance: Mapping[str, np.ndarray], axes: Mapping, depth: Mapping,
+                          registration: Mapping[str, dict], head_start: float) -> tuple[dict[str, np.ndarray], dict]:
+    """Match exposure only where two cameras see the same *body* surface.
+
+    This avoids whole-image colour matching (pink background or a tie would
+    otherwise alter a dark suit).  Ratios are robust medians of corresponding
+    vertices, then solved as a small view graph anchored to the front image.
+    """
+    count = min(len(vertices), 30000)
+    ids = np.linspace(0, len(vertices) - 1, count, dtype=np.int64)
+    points, point_normals = vertices[ids], normals[ids]
+    body = points[:, 1] < head_start
+    samples: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for name in VIEW_ORDER:
+        direction, screen_right = axes[name]
+        xy, d = _project(points, direction, screen_right, bounds, source_bounds[name], source[name].shape[:2], registration[name])
+        rgb, alpha = _sample_rgba(source[name], xy)
+        interior = _sample_scalar(interior_distance[name], xy)
+        z, scale, span = depth[name]
+        xi = np.clip((xy[:, 0] * scale).astype(int), 0, z.shape[1] - 1)
+        yi = np.clip((xy[:, 1] * scale).astype(int), 0, z.shape[0] - 1)
+        visible = d >= z[yi, xi] - max(span / max(z.shape), 1e-5) * 2.5
+        valid = body & visible & (alpha >= .98) & (interior >= 4) & ((point_normals @ direction) > .14)
+        # Ignore near-black and clipped highlights: neither is an exposure cue.
+        valid &= (rgb.min(axis=1) > .025) & (rgb.max(axis=1) < .97)
+        samples[name] = rgb, valid
+    log_gain = {name: np.zeros(3, dtype=np.float32) for name in VIEW_ORDER}
+    edges: list[tuple[str, str, np.ndarray, int]] = []
+    for ai, a in enumerate(VIEW_ORDER):
+        ar, av = samples[a]
+        for b in VIEW_ORDER[ai + 1:]:
+            br, bv = samples[b]
+            common = av & bv
+            if common.sum() < 24:
+                continue
+            ratio = np.log(np.clip(ar[common] / np.maximum(br[common], 1e-4), .65, 1.55))
+            edges.append((a, b, np.median(ratio, axis=0).astype(np.float32), int(common.sum())))
+    # Propagate estimates through all overlapping views.  More samples get more
+    # influence; front stays fixed to retain its accurate facial appearance.
+    for _ in range(8):
+        estimates = {name: [] for name in VIEW_ORDER}
+        for a, b, ratio, weight in edges:
+            estimates[b].append((log_gain[a] + ratio, weight))
+            estimates[a].append((log_gain[b] - ratio, weight))
+        for name in VIEW_ORDER:
+            if name == "front" or not estimates[name]:
+                continue
+            values, ws = zip(*estimates[name])
+            log_gain[name] = np.average(np.stack(values), axis=0, weights=np.asarray(ws)).astype(np.float32)
+    gains = {name: np.clip(np.exp(log_gain[name]), .82, 1.22).astype(np.float32) for name in VIEW_ORDER}
+    report = {"gains": {name: [round(float(x), 4) for x in gains[name]] for name in VIEW_ORDER},
+              "overlap_samples": {f"{a}-{b}": n for a, b, _, n in edges}}
+    return gains, report
+
+
 def project_texture(mesh: trimesh.Trimesh | str | Path,
                     images: Mapping[str, Image.Image | str | Path], out: str | Path,
                     resolution: int = 2048, front_axis: str = "+z") -> tuple[trimesh.Trimesh, dict]:
@@ -295,10 +442,16 @@ def project_texture(mesh: trimesh.Trimesh | str | Path,
         interior_distance = {name: (source[name][..., 3] >= 250).astype(np.float32) * 4.0 for name in VIEW_ORDER}
     axes = _view_axes(front_axis)
     depth = {}
+    depth_before = {}
+    registration = {}
     for name in VIEW_ORDER:
         direction, screen_right = axes[name]
+        initial = _zbuffer(vertices, faces, direction, screen_right, bounds,
+                           source_bounds[name], source[name].shape[:2])
+        depth_before[name] = initial
+        registration[name] = _silhouette_registration(initial[0], source[name])
         depth[name] = _zbuffer(vertices, faces, direction, screen_right, bounds,
-                               source_bounds[name], source[name].shape[:2])
+                               source_bounds[name], source[name].shape[:2], registration=registration[name])
 
     size = resolution
     colors = np.zeros((size, size, 3), dtype=np.float32)
@@ -312,7 +465,18 @@ def project_texture(mesh: trimesh.Trimesh | str | Path,
     uv = np.asarray(mesh.visual.uv)
     # xatlas UV is bottom-left origin; image arrays are top-left origin.
     uv_pixels = np.column_stack((uv[:, 0] * (size - 1), (1.0 - uv[:, 1]) * (size - 1)))
-    head_start = bounds[0, 1] + (bounds[1, 1] - bounds[0, 1]) * 0.82
+    # Includes jaw and hair but stops above the shirt collar.  The former 82%
+    # threshold protected only the upper forehead, leaving a seam through the
+    # cheek and mouth at a 45-degree view.
+    head_start = bounds[0, 1] + (bounds[1, 1] - bounds[0, 1]) * 0.73
+    head_vertices = vertices[vertices[:, 1] >= head_start]
+    # Gracefully support cropped busts with no vertices above the usual cutoff.
+    head_bounds = np.array((head_vertices.min(axis=0), head_vertices.max(axis=0))) if len(head_vertices) else bounds
+    head_depth = max(float(np.abs(axes["front"][0]) @ (head_bounds[1] - head_bounds[0])), 1e-4)
+    face_width = _screen_extent(bounds, axes["front"][1])
+    color_gains, color_report = _estimate_color_gains(
+        vertices, normals, faces, bounds, source, source_bounds, interior_distance,
+        axes, depth, registration, head_start)
     visible_samples = dict.fromkeys(VIEW_ORDER, 0)
     for face in faces:
         p = uv_pixels[face]
@@ -335,6 +499,8 @@ def project_texture(mesh: trimesh.Trimesh | str | Path,
         points = bary @ vertices[face]
         point_normals = bary @ normals[face]
         point_normals /= np.maximum(np.linalg.norm(point_normals, axis=1, keepdims=True), 1e-8)
+        portrait_authority = _portrait_front_authority(points, head_bounds, axes["front"][0], axes["front"][1])
+        portrait_authority[points[:, 1] < head_start] = 0.0
         # Do not average opposing photos: it causes immediately visible double
         # eyes and logos.  The best geometrically-supported source owns a texel.
         local_rgb = np.zeros((len(points), 3), dtype=np.float32)
@@ -342,25 +508,54 @@ def project_texture(mesh: trimesh.Trimesh | str | Path,
         second_rgb = np.zeros((len(points), 3), dtype=np.float32)
         second_weight = np.zeros(len(points), dtype=np.float32)
         local_owner = np.full(len(points), 255, dtype=np.uint8)
+        # Side photos are suppressed only where the front photo was actually
+        # sampled.  This avoids holes later filled from an unrelated UV chart.
+        front_available = np.zeros(len(points), dtype=np.float32)
         for view_index, name in enumerate(VIEW_ORDER):
             direction, screen_right = axes[name]
-            xy, point_depth = _project(points, direction, screen_right, bounds, source_bounds[name], source[name].shape[:2])
+            xy, point_depth = _project(points, direction, screen_right, bounds, source_bounds[name], source[name].shape[:2], registration[name])
             sampled_rgb, alpha = _sample_rgba(source[name], xy)
+            sampled_rgb = np.clip(sampled_rgb * color_gains[name], 0.0, 1.0)
             interior = _sample_scalar(interior_distance[name], xy)
             z, scale, span = depth[name]
             zzx = np.clip((xy[:, 0] * scale).astype(int), 0, z.shape[1] - 1)
             zzy = np.clip((xy[:, 1] * scale).astype(int), 0, z.shape[0] - 1)
             # A small tolerance allows the low-resolution z-buffer to represent slanted faces.
-            visible = point_depth >= z[zzy, zzx] - max(span / max(z.shape), 1e-5) * 2.5
+            depth_tolerance = max(span / max(z.shape), 1e-5) * 2.5
+            z_at_point = z[zzy, zzx]
+            visible = point_depth >= z_at_point - depth_tolerance
             facing = np.clip(point_normals @ direction, 0.0, 1.0)
             valid = visible & (alpha >= 0.98) & (interior >= 3.0) & (facing > 0.03)
-            edge_confidence = np.clip((interior - 3.0) / 6.0, 0.0, 1.0)
-            w = np.where(valid, facing ** 4 * alpha * edge_confidence, 0.0).astype(np.float32)
-            # Portrait detail is usually clearest in the true front image.  The
-            # boost is only used on confidently front-facing upper-body pixels.
+            relaxed_front = np.zeros(len(points), dtype=bool)
             if name == "front":
-                frontal_head = valid & (points[:, 1] >= head_start) & (facing >= 0.65)
-                w[frontal_head] *= 4.0
+                # The front z-buffer is coarse by design.  On the head's front
+                # hemisphere only, include points within 3% of head depth so a
+                # cheek does not switch cameras solely at a raster boundary.
+                relaxed_front = _relaxed_front_visibility(
+                    point_depth, z_at_point, alpha, interior, point_normals @ direction,
+                    portrait_authority, depth_tolerance + head_depth * .03)
+                valid |= relaxed_front
+            edge_confidence = np.clip((interior - 3.0) / 6.0, 0.0, 1.0)
+            selection_facing = facing.copy()
+            if name == "front":
+                selection_facing[relaxed_front] = np.clip(((point_normals @ direction)[relaxed_front] + .10) / 1.10, 0.0, 1.0)
+            w = np.where(valid, selection_facing ** 4 * alpha * edge_confidence, 0.0).astype(np.float32)
+            if name == "front":
+                # Selection priority must remain separate from validity: this
+                # factor never invents a colour for an occluded front sample.
+                front_available = (w > 0).astype(np.float32) * np.clip(facing / .12, 0.0, 1.0)
+            else:
+                # Smoothly hand over to the valid side source around temples.
+                w *= 1.0 - portrait_authority * front_available
+            # The front is usually the best portrait source, but a large hard
+            # boost creates a V-shaped cutout on a 45-degree cheek.  Prefer it
+            # continuously at the centre of the face and let the temples blend.
+            if name == "front":
+                frontal_head = valid & (points[:, 1] >= head_start)
+                # Strongly retain the frontal portrait in the central face;
+                # transition to the side source only around the temples below.
+                # This prevents an eye/nose from being cut in half at 45°.
+                w[frontal_head] *= (1.0 + 5.0 * portrait_authority[frontal_head])
             # Track two best views.  Clothing near a view boundary benefits
             # from a narrow blend; facial pixels retain a single strongest view
             # to prevent a profile photo printing a second face on the cheek.
@@ -379,12 +574,14 @@ def project_texture(mesh: trimesh.Trimesh | str | Path,
         # face.  This removes sharp clothing patches while keeping image detail
         # (eyes, mouths, emblems) owned by the best-aligned camera.
         clothing = points[:, 1] < head_start
-        narrow = clothing & (second_weight > 0) & (local_weight > 0)
+        # Keep the blend zone aligned with the geometric ownership transition.
+        blend_zone = np.where(clothing, 1.0, 1.0 - portrait_authority * front_available)
+        narrow = (blend_zone > 1e-5) & (second_weight > 0) & (local_weight > 0)
         ratio = second_weight[narrow] / local_weight[narrow]
         transition = np.clip((ratio - 0.25) / 0.75, 0.0, 1.0)
         # A smooth ramp reaches an equal blend at the ownership boundary.
         # The previous hard threshold jumped immediately from 0 to ~42%.
-        blend = (0.5 * transition * transition * (3.0 - 2.0 * transition))[:, None]
+        blend = (0.5 * transition * transition * (3.0 - 2.0 * transition) * blend_zone[narrow])[:, None]
         local_rgb[narrow] = local_rgb[narrow] * (1.0 - blend) + second_rgb[narrow] * blend
         atlas_mask[yy, xx] = True
         colors[yy, xx] = local_rgb

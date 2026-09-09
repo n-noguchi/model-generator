@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, os, shutil, uuid
+import hashlib, json, os, shutil, uuid
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -61,13 +61,14 @@ class CreateRun(BaseModel):
     cutout_mode:Literal["auto","color"]="auto"
     background:str="#FF00FF"
     tolerance:int=Field(48,ge=0,le=441)
-    bake_resolution:Literal[512,1024,2048,4096]=1024
-    generation_mode:Literal["sf3d","multiview"]="sf3d"
+    bake_resolution:Literal[2048,4096]=2048
+    generation_mode:Literal["multiview"]="multiview"
     inference_steps:Literal[50]=50
     octree_resolution:Literal[256,384]=384
     confirm_warning:bool=False
 class EvaluationIn(BaseModel): geometry:int=Field(ge=1,le=5); texture:int=Field(ge=1,le=5); overall:int=Field(ge=1,le=5); verdict:str; comment:str=""
 class OptimizeIn(BaseModel): triangles:int=Field(20000,ge=500,le=200000); texture_size:Literal[1024,2048,4096]=2048; lod:bool=False; collision:bool=False; height_m:Optional[float]=Field(None,gt=0)
+class RigIn(BaseModel): target_triangles:int=Field(30000,ge=2000,le=100000)
 class WorkerUpdate(BaseModel): progress:Optional[int]=Field(None,ge=0,le=100); log:Optional[str]=None; error:Optional[str]=None
 class JobOut(BaseModel): model_config=ConfigDict(from_attributes=True); id:str; kind:str; run_id:Optional[str]; candidate_id:Optional[str]; payload:str; status:str; progress:int; log:str
 
@@ -101,7 +102,7 @@ def run_detail(s:Session, run_id:str):
     candidates=list(s.scalars(select(Candidate).where(Candidate.run_id==run_id).order_by(Candidate.number))); ids=[c.id for c in candidates]
     return {"run":serialize(r),"candidates":[serialize(c) for c in candidates],"jobs":[serialize(j) for j in s.scalars(select(Job).where(Job.run_id==run_id).order_by(Job.created_at))],"artifacts":[serialize(a) for a in s.scalars(select(Artifact).where(Artifact.candidate_id.in_(ids))) ] if ids else []}
 @app.get("/health")
-def health(): return {"mode":os.getenv("BACKEND_MODE","mock"),"data_dir":str(DATA),"gpu":"checked by sf3d worker"}
+def health(): return {"mode":"multiview", "data_dir":str(DATA),"gpu":"required by sf3d worker"}
 @app.post("/uploads")
 async def upload(image:UploadFile=File(...), original:bool=False):
     if image.content_type not in {"image/png","image/jpeg"}: raise HTTPException(415,"PNG/JPEG only")
@@ -129,25 +130,19 @@ def image_warning(input_path:str, original_path:Optional[str], bg:str, tolerance
 def generation_payload(r:Run, c:Candidate):
     """Keep the worker contract in one place for new and added candidates."""
     payload={"input_path":r.input_path,"generation_view":"front","cutout_mode":r.cutout_mode,"background":r.background,"tolerance":r.tolerance,"bake_resolution":r.bake_resolution,"generation_mode":r.generation_mode,"seed":c.seed}
-    if r.generation_mode=="multiview":
-        payload.update({"front_path":r.input_path,"back_path":r.back_path,"left_path":r.left_path,"right_path":r.right_path,"inference_steps":r.inference_steps,"octree_resolution":r.octree_resolution})
+    payload.update({"generation_mode":"multiview", "front_path":r.input_path,"back_path":r.back_path,"left_path":r.left_path,"right_path":r.right_path,"inference_steps":r.inference_steps,"octree_resolution":r.octree_resolution})
     return payload
 @app.post("/runs")
 def create_run(body:CreateRun,s:Session=Depends(db)):
     get_or_404(s,Project,body.project_id)
     for path in (body.input_path, body.original_path, body.back_path, body.left_path, body.right_path):
         if path and not abs_path(path).is_file(): raise HTTPException(422,"uploaded image was not found")
-    if body.generation_mode=="multiview":
-        if not all((body.input_path,body.back_path,body.left_path,body.right_path)):
-            raise HTTPException(422,"multiview generation requires front, back, left, and right images")
-        if body.bake_resolution not in {2048,4096}:
-            raise HTTPException(422,"multiview generation requires a 2048 or 4096 texture")
-    elif body.bake_resolution not in {512,1024,2048}:
-        raise HTTPException(422,"sf3d generation supports 512, 1024, or 2048 textures")
+    if not all((body.input_path,body.back_path,body.left_path,body.right_path)):
+        raise HTTPException(422,"高品質4方向生成には正面・背面・本人基準の左・右画像が必要です")
     warning=image_warning(body.input_path,body.original_path,body.background,body.tolerance,body.cutout_mode)
     if warning and not body.confirm_warning: return {"warning":warning,"requires_confirmation":True}
     r=Run(**body.model_dump(exclude={"confirm_warning"}),warning=warning);s.add(r);s.flush()
-    for n in range(1,2 if r.generation_mode=="multiview" else 4):
+    for n in range(1,2):
         c=Candidate(run_id=r.id,number=n,seed=1000+n);s.add(c);s.flush();s.add(Job(kind="generate",run_id=r.id,candidate_id=c.id,payload=json.dumps(generation_payload(r,c))))
     s.commit();return run_detail(s,r.id)
 @app.get("/runs/{run_id}")
@@ -172,7 +167,10 @@ def artifact(artifact_id:str,s:Session=Depends(db)):
     return serialize(get_or_404(s,Artifact,artifact_id))
 @app.post("/runs/{run_id}/candidates")
 def add_candidate(run_id:str,s:Session=Depends(db)):
-    r=get_or_404(s,Run,run_id); n=len(list(s.scalars(select(Candidate).where(Candidate.run_id==run_id))))+1;c=Candidate(run_id=run_id,number=n,seed=1000+n);s.add(c);s.flush();s.add(Job(kind="generate",run_id=run_id,candidate_id=c.id,payload=json.dumps(generation_payload(r,c))));sync_run_status(s,run_id);s.commit();return serialize(c)
+    r=get_or_404(s,Run,run_id)
+    if r.generation_mode != "multiview" or not all((r.input_path, r.back_path, r.left_path, r.right_path)):
+        raise HTTPException(409,"旧形式のRunには候補を追加できません。新しい4方向Runを作成してください")
+    n=len(list(s.scalars(select(Candidate).where(Candidate.run_id==run_id))))+1;c=Candidate(run_id=run_id,number=n,seed=1000+n);s.add(c);s.flush();s.add(Job(kind="generate",run_id=run_id,candidate_id=c.id,payload=json.dumps(generation_payload(r,c))));sync_run_status(s,run_id);s.commit();return serialize(c)
 @app.post("/candidates/{candidate_id}/select")
 def choose(candidate_id:str,s:Session=Depends(db)):
     c=get_or_404(s,Candidate,candidate_id); r=get_or_404(s,Run,c.run_id);r.selected_candidate_id=c.id;s.commit();return serialize(r)
@@ -182,6 +180,16 @@ def evaluate(candidate_id:str,body:EvaluationIn,s:Session=Depends(db)):
 @app.post("/candidates/{candidate_id}/optimize")
 def optimize(candidate_id:str,body:OptimizeIn,s:Session=Depends(db)):
     c=get_or_404(s,Candidate,candidate_id);j=Job(kind="optimize",run_id=c.run_id,candidate_id=c.id,payload=body.model_dump_json());s.add(j);s.commit();return serialize(j)
+@app.post("/candidates/{candidate_id}/rig")
+def rig(candidate_id:str,body:RigIn,s:Session=Depends(db)):
+    c=get_or_404(s,Candidate,candidate_id)
+    if c.status != "completed" or not c.model_path or not abs_path(c.model_path).is_file():
+        raise HTTPException(409,"完了したGLB候補を選択してから、リグ・スキニングを開始してください")
+    source=abs_path(c.model_path)
+    source_hash=hashlib.sha256(source.read_bytes()).hexdigest()
+    payload={"source_model_path":c.model_path,"source_sha256":source_hash,"target_triangles":body.target_triangles,
+             "pipeline":"cleanup-decimate-auto-rig-auto-weights-v2"}
+    j=Job(kind="rig",run_id=c.run_id,candidate_id=c.id,payload=json.dumps(payload));s.add(j);s.commit();return serialize(j)
 @app.post("/candidates/{candidate_id}/export")
 def export(candidate_id:str,formats:list[str],preset:str="Generic",s:Session=Depends(db)):
     c=get_or_404(s,Candidate,candidate_id)
@@ -211,7 +219,7 @@ def complete(job_id:str,result:dict,s:Session=Depends(db)):
     j=get_or_404(s,Job,job_id); j.status="completed";j.progress=100;j.log+="completed\n"
     c=get_or_404(s,Candidate,j.candidate_id) if j.candidate_id else None
     if j.kind=="generate" and c: c.status="completed";c.model_path=result.get("model_path");c.preview_path=result.get("preview_path");c.score=result.get("score")
-    if j.kind=="export" and c:
+    if j.kind in {"export","rig"} and c:
         for kind,path in result.get("artifacts",{}).items(): s.add(Artifact(candidate_id=c.id,kind=kind,path=path,metadata_json=json.dumps(result.get("metadata",{}))))
     if j.kind=="optimize" and c and result.get("model_path"): c.model_path=result["model_path"]
     sync_run_status(s,j.run_id);s.commit();return serialize(j)

@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { Canvas, useThree } from "@react-three/fiber";
 import { OrbitControls, useGLTF } from "@react-three/drei";
 import * as THREE from "three";
+import { clone as cloneSkeleton } from "three/examples/jsm/utils/SkeletonUtils.js";
 import "./style.css";
 const api = "/api";
 const call = async (p: string, o?: RequestInit) => {
@@ -104,13 +105,41 @@ function Model({
   path,
   mode,
   texture,
+  showSkeleton = false,
+  pose = "rest",
 }: {
   path: string;
   mode: string;
   texture: boolean;
+  showSkeleton?: boolean;
+  pose?: string;
 }) {
   const gltf = useGLTF(api + "/files/" + path);
-  const scene = useMemo(() => gltf.scene.clone(true), [gltf.scene]);
+  // SkinnedMesh needs SkeletonUtils: Object3D.clone leaves its bone references
+  // pointing at the source scene, so a helper could move without deforming mesh.
+  const scene = useMemo(() => cloneSkeleton(gltf.scene), [gltf.scene]);
+  const skeleton = useMemo(() => showSkeleton ? new THREE.SkeletonHelper(scene) : undefined, [scene, showSkeleton]);
+  useEffect(() => {
+    const bones: Record<string, THREE.Bone> = {};
+    scene.traverse((o: any) => {
+      if (!o.isBone) return;
+      bones[o.name] = o;
+      if (!o.userData.restQuaternion) o.userData.restQuaternion = o.quaternion.clone();
+      o.quaternion.copy(o.userData.restQuaternion);
+    });
+    const rotate = (name: string, axis: THREE.Vector3, degrees: number) => {
+      const bone = bones[name];
+      if (bone) bone.quaternion.multiply(new THREE.Quaternion().setFromAxisAngle(axis, THREE.MathUtils.degToRad(degrees)));
+    };
+    if (pose === "arms") {
+      rotate("UpperArm.L", new THREE.Vector3(0, 0, 1), -55); rotate("UpperArm.R", new THREE.Vector3(0, 0, 1), 55);
+      rotate("LowerArm.L", new THREE.Vector3(0, 1, 0), 70); rotate("LowerArm.R", new THREE.Vector3(0, 1, 0), -70);
+    } else if (pose === "legs") {
+      rotate("UpperLeg.L", new THREE.Vector3(1, 0, 0), 35); rotate("UpperLeg.R", new THREE.Vector3(1, 0, 0), -20);
+      rotate("LowerLeg.L", new THREE.Vector3(1, 0, 0), -65); rotate("LowerLeg.R", new THREE.Vector3(1, 0, 0), -25);
+    }
+    scene.updateMatrixWorld(true);
+  }, [scene, pose]);
   useEffect(() => {
     scene.traverse((o: any) => {
       if (!o.isMesh) return;
@@ -129,7 +158,7 @@ function Model({
       }
     });
   }, [scene, mode, texture]);
-  return <primitive object={scene} />;
+  return <><primitive object={scene} />{skeleton && <primitive object={skeleton} />}</>;
 }
 function Camera({ preset, multiview }: { preset: string; multiview: boolean }) {
   const { camera } = useThree();
@@ -146,11 +175,14 @@ function Camera({ preset, multiview }: { preset: string; multiview: boolean }) {
   }, [camera, preset, multiview]);
   return null;
 }
-function Viewer({ candidate, multiview = false }: { candidate?: Candidate; multiview?: boolean }) {
+function Viewer({ candidate, multiview = false, modelPath, rigPreview = false }: { candidate?: Candidate; multiview?: boolean; modelPath?: string; rigPreview?: boolean }) {
   const [mode, setMode] = useState("solid"),
     [texture, setTexture] = useState(true),
-    [preset, setPreset] = useState("front");
-  if (!candidate?.model_path)
+    [preset, setPreset] = useState("front"),
+    [pose, setPose] = useState("rest");
+  const path = modelPath || candidate?.model_path;
+  useEffect(() => setPose("rest"), [path]);
+  if (!path)
     return (
       <div className="viewer empty">
         完了した候補を選択すると3Dプレビューを表示します。
@@ -167,6 +199,8 @@ function Viewer({ candidate, multiview = false }: { candidate?: Candidate; multi
             <option value="matcap">MatCap</option>
           </select>
         </label>
+        {rigPreview && <span className="toolbar-note">緑の線: スキニングされた骨格</span>}
+        {rigPreview && <label>ポーズ確認 <select value={pose} onChange={(e) => setPose(e.target.value)}><option value="rest">レストポーズ</option><option value="arms">肩・肘テスト</option><option value="legs">股関節・膝テスト</option></select></label>}
         <label>
           <input
             type="checkbox"
@@ -194,7 +228,7 @@ function Viewer({ candidate, multiview = false }: { candidate?: Candidate; multi
           <directionalLight position={[3, 4, 3]} />
           <Camera preset={preset} multiview={multiview} />
           <React.Suspense fallback={<></>}>
-            <Model path={candidate.model_path} mode={mode} texture={texture} />
+            <Model path={path} mode={mode} texture={texture} showSkeleton={rigPreview} pose={pose} />
           </React.Suspense>
           <OrbitControls />
         </Canvas>
@@ -294,7 +328,6 @@ function App() {
     [cutoutMode, setCutoutMode] = useState<"auto" | "color">("auto"),
     [background, setBackground] = useState("#FF00FF"),
     [tolerance, setTolerance] = useState(48),
-    [generationMode, setGenerationMode] = useState<"sf3d" | "multiview">("multiview"),
     [bakeResolution, setBakeResolution] = useState<512 | 1024 | 2048 | 4096>(2048),
     [octreeResolution, setOctreeResolution] = useState<256 | 384>(384),
     [runs, setRuns] = useState<Row[]>([]),
@@ -308,6 +341,8 @@ function App() {
     [lod, setLod] = useState(false),
     [collision, setCollision] = useState(false),
     [height, setHeight] = useState("");
+  const [rigPreviewPath, setRigPreviewPath] = useState<string>();
+  useEffect(() => setRigPreviewPath(undefined), [selected?.id]);
   const fail = (e: unknown) =>
     setError(e instanceof Error ? e.message : "操作に失敗しました");
   const setFile = (key: ViewKey, file?: File) =>
@@ -387,7 +422,7 @@ function App() {
     }
   };
   const generate = async () => {
-    if (!project || !files.front || (generationMode === "multiview" && (!files.back || !files.left || !files.right))) return;
+    if (!project || !files.front || !files.back || !files.left || !files.right) return;
     try {
       setLoading(true);
       const uploaded: Partial<Record<ViewKey, string>> = {};
@@ -403,7 +438,7 @@ function App() {
         background,
         tolerance,
         bake_resolution: bakeResolution,
-        generation_mode: generationMode,
+        generation_mode: "multiview",
         inference_steps: 50,
         octree_resolution: octreeResolution,
         confirm_warning: false,
@@ -503,23 +538,15 @@ function App() {
           <strong>方向の基準:</strong> 左右は画面を見る側ではなく、
           <strong>人物本人から見た左右</strong>です。
         </div>
-        <div className="generation-mode" role="radiogroup" aria-label="生成方式">
-          <label>
-            <input type="radio" checked={generationMode === "multiview"} onChange={() => { setGenerationMode("multiview"); setBakeResolution(2048); }} />
-            <strong>全身高品質（4方向）</strong>
-            <span>4枚を形状・テクスチャへ使用します。時間がかかります。</span>
-          </label>
-          <label>
-            <input type="radio" checked={generationMode === "sf3d"} onChange={() => { setGenerationMode("sf3d"); setBakeResolution(1024); }} />
-            <strong>高速 SF3D（正面1枚）</strong>
-            <span>背面・左右は保存・比較のみで、生成には使用しません。</span>
-          </label>
+        <div className="generation-mode">
+          <strong>全身高品質（4方向）</strong>
+          <span>正面・背面・人物本人基準の左・右の4枚すべてを、形状と全身テクスチャに使用します。</span>
         </div>
         <div className="input-grid">
           {views.map((view) => (
             <FileCard
               key={view.key}
-              view={{...view, required: generationMode === "multiview" || view.key === "front", help: view.help + (generationMode === "multiview" ? " 高品質生成に使用します。" : view.key === "front" ? " SF3D生成に使用します。" : " 参照・比較用で、生成には使用しません。")}}
+              view={{...view, required: true, help: view.help + " 高品質生成に使用します。"}}
               file={files[view.key]}
               onChange={(file) => setFile(view.key, file)}
               onRemove={() => setFile(view.key)}
@@ -566,8 +593,8 @@ function App() {
         </div>
         <div className="generate-row">
           <div>
-            <strong>{generationMode === "multiview" ? "全身高品質・4方向再構成" : "Single Image推定"}</strong>
-            <p>{generationMode === "multiview" ? "前後左右を形状生成に使い、元の4画像を全身テクスチャへ投影します。生成は1候補ずつ実行します。" : "SF3Dは正面画像のみを使用します。背面・左右の参照画像は3Dへ融合されません。"}</p>
+            <strong>全身高品質・4方向再構成</strong>
+            <p>前後左右を形状生成に使い、元の4画像を全身テクスチャへ投影します。生成は1候補ずつ実行します。</p>
             <label>
               生成テクスチャ解像度{" "}
               <select
@@ -576,18 +603,18 @@ function App() {
                   setBakeResolution(Number(e.target.value) as 512 | 1024 | 2048 | 4096)
                 }
               >
-                {generationMode === "multiview" ? <><option value={2048}>2048px（推奨）</option><option value={4096}>4096px（最高精細・時間とメモリを使用）</option></> : <><option value={512}>512px（高速）</option><option value={1024}>1024px（推奨）</option><option value={2048}>2048px（高精細・時間とVRAMを使用）</option></>}
+                <><option value={2048}>2048px（推奨）</option><option value={4096}>4096px（最高精細・時間とメモリを使用）</option></>
               </select>
             </label>
-            {generationMode === "multiview" && <label>形状密度 <select value={octreeResolution} onChange={(e) => setOctreeResolution(Number(e.target.value) as 256 | 384)}><option value={256}>256（省メモリ）</option><option value={384}>384（高品質・推奨）</option></select></label>}
+            <label>形状密度 <select value={octreeResolution} onChange={(e) => setOctreeResolution(Number(e.target.value) as 256 | 384)}><option value={256}>256（省メモリ）</option><option value={384}>384（高品質・推奨）</option></select></label>
             <p>顔を含む品質は入力画像・視点整合性の影響を受けます。ゲーム用の整理、リグ、スキニングは後工程です。</p>
           </div>
           <button
             className="generate"
-            disabled={!project || !files.front || (generationMode === "multiview" && (!files.back || !files.left || !files.right)) || loading}
+            disabled={!project || !files.front || !files.back || !files.left || !files.right || loading}
             onClick={() => void generate()}
           >
-            {loading ? "準備中…" : generationMode === "multiview" ? "4方向から高品質モデルを生成" : "正面画像から3候補を生成"}
+            {loading ? "準備中…" : "4方向から高品質モデルを生成"}
           </button>
         </div>
       </section>
@@ -632,7 +659,7 @@ function App() {
             </div>
             {run.run.warning && <p className="warning">{run.run.warning}</p>}
             <p className="muted">
-              {run.run.generation_mode === "multiview" ? `全身高品質（4方向・${run.run.inference_steps ?? 50}ステップ・形状密度 ${run.run.octree_resolution ?? 384}）` : "高速 SF3D（正面1枚）"}
+              {run.run.generation_mode === "multiview" ? `全身高品質（4方向・${run.run.inference_steps ?? 50}ステップ・形状密度 ${run.run.octree_resolution ?? 384}）` : "旧形式: 高速 SF3D（正面1枚）"}
               {" / テクスチャ解像度: "}{run.run.bake_resolution ?? 512}px
             </p>
             <div className="stored-grid">
@@ -677,7 +704,7 @@ function App() {
                 <h2>候補比較と3Dプレビュー</h2>
               </div>
             </div>
-            <Viewer candidate={selected} multiview={run.run.generation_mode === "multiview"} />
+            <Viewer candidate={selected} multiview={run.run.generation_mode === "multiview"} modelPath={rigPreviewPath} rigPreview={!!rigPreviewPath} />
             <div className="grid">
               {candidates.map((c) => (
                 <article
@@ -752,9 +779,10 @@ function App() {
               <div className="section-title">
                 <div>
                   <p className="step">STEP 5</p>
-                  <h2>最適化と書き出し</h2>
+                  <h2>ゲーム向け整理・リグ・書き出し</h2>
                 </div>
               </div>
+              <p className="muted">「自動リグ・スキニング」は、別成果物としてメッシュの重複頂点・法線を整理し、指定ポリゴン数へ簡略化後に基本人体骨格と自動ウェイトを作成します。元の候補は変更しません。腕を自然に下げた直立全身モデル向けの試作機能です。</p>
               <div className="optimize">
                 {[5000, 10000, 20000, 50000].map((n) => (
                   <button
@@ -830,6 +858,18 @@ function App() {
                   最適化
                 </button>
                 <button
+                  disabled={selected.status !== "completed" || loading}
+                  onClick={() =>
+                    void action("/candidates/" + selected.id + "/rig", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ target_triangles: tri }),
+                    })
+                  }
+                >
+                  自動リグ・スキニング（別成果物）
+                </button>
+                <button
                   onClick={() =>
                     void action(
                       "/candidates/" + selected.id + "/export?preset=Generic",
@@ -851,6 +891,13 @@ function App() {
                     <a key={a.id} href={api + "/files/" + a.path} download>
                       {a.kind.toUpperCase()} をダウンロード
                     </a>
+                  ))}
+                {artifacts
+                  .filter((a) => a.candidate_id === selected.id && a.kind === "rigged_glb")
+                  .map((a) => (
+                    <button key={a.id} className={rigPreviewPath === a.path ? "on" : ""} onClick={() => setRigPreviewPath(rigPreviewPath === a.path ? undefined : a.path)}>
+                      {rigPreviewPath === a.path ? "元モデルを表示" : "リグをプレビュー（骨格表示）"}
+                    </button>
                   ))}
               </div>
             </section>
