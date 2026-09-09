@@ -1,6 +1,6 @@
-import React, { Component, useEffect, useMemo, useState } from "react";
+import React, { Component, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Canvas, useThree } from "@react-three/fiber";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { OrbitControls, useGLTF } from "@react-three/drei";
 import * as THREE from "three";
 import { clone as cloneSkeleton } from "three/examples/jsm/utils/SkeletonUtils.js";
@@ -107,18 +107,45 @@ function Model({
   texture,
   showSkeleton = false,
   pose = "rest",
+  animation,
+  onAnimationNames,
 }: {
   path: string;
   mode: string;
   texture: boolean;
   showSkeleton?: boolean;
   pose?: string;
+  animation?: { clip: string; playing: boolean; loop: boolean; speed: number; restart: number };
+  onAnimationNames?: (names: string[]) => void;
 }) {
   const gltf = useGLTF(api + "/files/" + path);
   // SkinnedMesh needs SkeletonUtils: Object3D.clone leaves its bone references
   // pointing at the source scene, so a helper could move without deforming mesh.
   const scene = useMemo(() => cloneSkeleton(gltf.scene), [gltf.scene]);
   const skeleton = useMemo(() => showSkeleton ? new THREE.SkeletonHelper(scene) : undefined, [scene, showSkeleton]);
+  const mixer = useMemo(() => new THREE.AnimationMixer(scene), [scene]);
+  const actionRef = useRef<THREE.AnimationAction>();
+  useFrame((_, delta) => mixer.update(delta));
+  useEffect(() => onAnimationNames?.(gltf.animations.map((clip) => clip.name)), [gltf.animations, onAnimationNames]);
+  useEffect(() => {
+    mixer.stopAllAction();
+    actionRef.current = undefined;
+    if (!animation?.clip) return;
+    const clip = gltf.animations.find((candidate) => candidate.name === animation.clip);
+    if (!clip) return;
+    const action = mixer.clipAction(clip);
+    actionRef.current = action;
+    action.reset().play();
+    return () => { action.stop(); mixer.uncacheAction(clip); };
+  }, [animation?.clip, animation?.restart, gltf.animations, mixer]);
+  useEffect(() => {
+    const action = actionRef.current;
+    if (!action || !animation?.clip) return;
+    action.paused = !animation.playing;
+    action.setLoop(animation.loop ? THREE.LoopRepeat : THREE.LoopOnce, animation.loop ? Infinity : 1);
+    action.clampWhenFinished = !animation.loop;
+    action.timeScale = animation.speed;
+  }, [animation?.clip, animation?.loop, animation?.playing, animation?.speed, animation?.restart, gltf.animations, mixer]);
   useEffect(() => {
     const bones: Record<string, THREE.Bone> = {};
     scene.traverse((o: any) => {
@@ -131,6 +158,9 @@ function Model({
       const bone = bones[name];
       if (bone) bone.quaternion.multiply(new THREE.Quaternion().setFromAxisAngle(axis, THREE.MathUtils.degToRad(degrees)));
     };
+    // Manual pose checks and an AnimationMixer both modify pose bones; never
+    // apply them together, or the preview would give misleading deformation.
+    if (animation?.clip) return;
     if (pose === "arms") {
       rotate("UpperArm.L", new THREE.Vector3(0, 0, 1), -55); rotate("UpperArm.R", new THREE.Vector3(0, 0, 1), 55);
       rotate("LowerArm.L", new THREE.Vector3(0, 1, 0), 70); rotate("LowerArm.R", new THREE.Vector3(0, 1, 0), -70);
@@ -139,7 +169,7 @@ function Model({
       rotate("LowerLeg.L", new THREE.Vector3(1, 0, 0), -65); rotate("LowerLeg.R", new THREE.Vector3(1, 0, 0), -25);
     }
     scene.updateMatrixWorld(true);
-  }, [scene, pose]);
+  }, [scene, pose, animation?.clip]);
   useEffect(() => {
     scene.traverse((o: any) => {
       if (!o.isMesh) return;
@@ -175,13 +205,21 @@ function Camera({ preset, multiview }: { preset: string; multiview: boolean }) {
   }, [camera, preset, multiview]);
   return null;
 }
-function Viewer({ candidate, multiview = false, modelPath, rigPreview = false }: { candidate?: Candidate; multiview?: boolean; modelPath?: string; rigPreview?: boolean }) {
+function Viewer({ candidate, multiview = false, modelPath, rigPreview = false, motionPreview = false }: { candidate?: Candidate; multiview?: boolean; modelPath?: string; rigPreview?: boolean; motionPreview?: boolean }) {
   const [mode, setMode] = useState("solid"),
     [texture, setTexture] = useState(true),
     [preset, setPreset] = useState("front"),
-    [pose, setPose] = useState("rest");
+    [pose, setPose] = useState("rest"),
+    [animationNames, setAnimationNames] = useState<string[]>([]),
+    [clip, setClip] = useState(""),
+    [playing, setPlaying] = useState(true),
+    [loop, setLoop] = useState(true),
+    [speed, setSpeed] = useState(1),
+    [restart, setRestart] = useState(0);
   const path = modelPath || candidate?.model_path;
-  useEffect(() => setPose("rest"), [path]);
+  useEffect(() => { setPose("rest"); setAnimationNames([]); setClip(""); setPlaying(true); }, [path]);
+  useEffect(() => { if (motionPreview && !clip && animationNames[0]) setClip(animationNames[0]); }, [motionPreview, clip, animationNames]);
+  const animation = motionPreview && clip ? { clip, playing, loop, speed, restart } : undefined;
   if (!path)
     return (
       <div className="viewer empty">
@@ -200,7 +238,16 @@ function Viewer({ candidate, multiview = false, modelPath, rigPreview = false }:
           </select>
         </label>
         {rigPreview && <span className="toolbar-note">緑の線: スキニングされた骨格</span>}
-        {rigPreview && <label>ポーズ確認 <select value={pose} onChange={(e) => setPose(e.target.value)}><option value="rest">レストポーズ</option><option value="arms">肩・肘テスト</option><option value="legs">股関節・膝テスト</option></select></label>}
+        {rigPreview && !motionPreview && <label>ポーズ確認 <select value={pose} onChange={(e) => setPose(e.target.value)}><option value="rest">レストポーズ</option><option value="arms">肩・肘テスト</option><option value="legs">股関節・膝テスト</option></select></label>}
+        {motionPreview && <>
+          <label>クリップ <select value={clip} onChange={(e) => setClip(e.target.value)} disabled={!animationNames.length}>
+            <option value="">選択してください</option>{animationNames.map((name) => <option key={name} value={name}>{name}</option>)}</select></label>
+          <button disabled={!clip} onClick={() => setPlaying((value) => !value)}>{playing ? "一時停止" : "再生"}</button>
+          <button disabled={!clip} onClick={() => { setRestart((value) => value + 1); setPlaying(true); }}>先頭へ戻す</button>
+          <label><input type="checkbox" checked={loop} onChange={(e) => setLoop(e.target.checked)} /> ループ</label>
+          <label>速度 <input aria-label="モーション再生速度" type="number" min="0.1" max="3" step="0.1" value={speed} onChange={(e) => setSpeed(Math.min(3, Math.max(.1, Number(e.target.value) || 1)))} /></label>
+          {!animationNames.length && <span className="toolbar-note">モーションクリップを読み込み中です</span>}
+        </>}
         <label>
           <input
             type="checkbox"
@@ -228,7 +275,7 @@ function Viewer({ candidate, multiview = false, modelPath, rigPreview = false }:
           <directionalLight position={[3, 4, 3]} />
           <Camera preset={preset} multiview={multiview} />
           <React.Suspense fallback={<></>}>
-            <Model path={path} mode={mode} texture={texture} showSkeleton={rigPreview} pose={pose} />
+            <Model path={path} mode={mode} texture={texture} showSkeleton={rigPreview} pose={pose} animation={animation} onAnimationNames={motionPreview ? setAnimationNames : undefined} />
           </React.Suspense>
           <OrbitControls />
         </Canvas>
@@ -474,6 +521,22 @@ function App() {
   };
   const candidates = run?.candidates || [],
     artifacts = run?.artifacts || [];
+  const selectedArtifacts = selected
+    ? artifacts.filter((artifact) => artifact.candidate_id === selected.id)
+    : [];
+  const selectedJobs = selected
+    ? (run?.jobs || []).filter((job) => job.candidate_id === selected.id && job.kind !== "generate")
+    : [];
+  const latestCompletedGameJob = [...selectedJobs].reverse().find((job) => job.kind === "game_prepare" && job.status === "completed");
+  const latestUnityLod0 = latestCompletedGameJob
+    ? selectedArtifacts.find((artifact) => artifact.kind === "unity_lod0_glb" && artifact.path.includes(`/${latestCompletedGameJob.id}/`))
+    : undefined;
+  const canCreateMotion = !!latestUnityLod0 && selected?.status === "completed";
+  const motionBlockedReason = !selected || selected.status !== "completed"
+    ? "完了した候補を選択してください。"
+    : !latestUnityLod0
+      ? "先に「Unity用ゲームパッケージ」を完了すると、LOD0モデルからモーションを生成できます。"
+      : "";
   return (
     <main>
       <header>
@@ -681,7 +744,7 @@ function App() {
               ))}
             </div>
             <div className="job-list">
-              {run.jobs.map((j) => (
+              {run.jobs.filter((job) => job.kind === "generate").map((j) => (
                 <div key={j.id}>
                   <b>
                     Candidate{" "}
@@ -701,10 +764,11 @@ function App() {
             <div className="section-title">
               <div>
                 <p className="step">STEP 4</p>
-                <h2>候補比較と3Dプレビュー</h2>
+                <h2>候補の選択</h2>
               </div>
             </div>
-            <Viewer candidate={selected} multiview={run.run.generation_mode === "multiview"} modelPath={rigPreviewPath} rigPreview={!!rigPreviewPath} />
+            <p className="muted">ゲーム向けの処理、進捗、リグ・モーションのプレビューは次のSTEP 5にまとめています。</p>
+            <Viewer candidate={selected} multiview={run.run.generation_mode === "multiview"} />
             <div className="grid">
               {candidates.map((c) => (
                 <article
@@ -779,10 +843,15 @@ function App() {
               <div className="section-title">
                 <div>
                   <p className="step">STEP 5</p>
-                  <h2>ゲーム向け整理・リグ・書き出し</h2>
+                  <h2>ゲーム向け成果物</h2>
                 </div>
               </div>
-              <p className="muted">「自動リグ・スキニング」は、別成果物としてメッシュの重複頂点・法線を整理し、指定ポリゴン数へ簡略化後に基本人体骨格と自動ウェイトを作成します。元の候補は変更しません。腕を自然に下げた直立全身モデル向けの試作機能です。</p>
+              <p className="muted">選択中: Candidate {selected.number}。ここでゲーム向け処理の開始、進捗確認、成果物のダウンロードとプレビューを完結できます。自動リグ・Unityパッケージ・モーションは元候補を変更しません。</p>
+              <div className="game-workspace">
+                <article className="game-card">
+                  <h3>1. メッシュ最適化（任意）</h3>
+                  <p>候補の表示モデルを指定ポリゴン数へ置き換えます。元の候補モデルを上書きするため、必要な場合だけ実行してください。</p>
+                  <p className="setting-note"><strong>共通の目標ポリゴン数:</strong> ここで選ぶ数値は、最適化だけでなく次の自動リグとUnity LOD0の目標にも使われます。</p>
               <div className="optimize">
                 {[5000, 10000, 20000, 50000].map((n) => (
                   <button
@@ -857,6 +926,11 @@ function App() {
                 >
                   最適化
                 </button>
+                </div>
+                </article>
+                <article className="game-card">
+                  <h3>2. リグ付きモデルを作成</h3>
+                  <p>上の共通目標ポリゴン数で、基本人体骨格と自動ウェイトを別成果物として作成します。腕を自然に下げた直立全身モデル向けです。</p>
                 <button
                   disabled={selected.status !== "completed" || loading}
                   onClick={() =>
@@ -869,6 +943,39 @@ function App() {
                 >
                   自動リグ・スキニング（別成果物）
                 </button>
+                </article>
+                <article className="game-card">
+                  <h3>3. Unity用ゲームパッケージ</h3>
+                  <p>上の共通目標ポリゴン数をLOD0に使用し、LOD0 / 1 / 2、FBX、Humanoid対応表、Capsule Collider設定を出力します。</p>
+                <button
+                  disabled={selected.status !== "completed" || loading}
+                  onClick={() =>
+                    void action("/candidates/" + selected.id + "/game-prepare", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ lod0_triangles: tri }),
+                    })
+                  }
+                >
+                  Unity用ゲームパッケージ（LOD0/1/2）
+                </button>
+                </article>
+                <article className="game-card">
+                  <h3>4. テンプレートモーション</h3>
+                  <p>Idle / Walk / Run / Jump / Wave を、最新のUnity LOD0から生成します。</p>
+                <button
+                  disabled={!canCreateMotion}
+                  onClick={() => {
+                    if (latestUnityLod0) void action("/candidates/" + selected.id + "/motions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ artifact_id: latestUnityLod0.id }) });
+                  }}
+                >
+                  テンプレートモーション生成（Idle / Walk / Run / Jump / Wave）
+                </button>
+                {!canCreateMotion && <p className="blocked-reason" role="status">生成できない理由: {motionBlockedReason}</p>}
+                </article>
+                <article className="game-card">
+                  <h3>5. 汎用エクスポート</h3>
+                  <p>選択中候補をGLB / FBX / ZIPとして書き出します。</p>
                 <button
                   onClick={() =>
                     void action(
@@ -883,20 +990,31 @@ function App() {
                 >
                   GLB / FBX / ZIP Export
                 </button>
+                </article>
+              </div>
+              <div className="game-results">
+                <div>
+                  <h3>ゲーム向け処理の進捗</h3>
+                  {selectedJobs.length ? <div className="job-list">{selectedJobs.map((j) => (
+                    <div key={j.id}><b>{j.kind}</b><span className={"badge state-" + j.status}>{j.status}</span><progress max="100" value={j.progress} /><span>{j.progress}%</span>{j.log && <small>{j.log}</small>}</div>
+                  ))}</div> : <p className="muted">この候補では、まだゲーム向け処理を開始していません。</p>}
+                </div>
+                <div>
+                  <h3>リグ・モーションのプレビュー</h3>
+                  <Viewer candidate={selected} multiview={run.run.generation_mode === "multiview"} modelPath={rigPreviewPath} rigPreview={!!rigPreviewPath} motionPreview={selectedArtifacts.some((a) => a.path === rigPreviewPath && a.kind === "template_motion_glb")} />
+                </div>
               </div>
               <div className="downloads">
-                {artifacts
-                  .filter((a) => a.candidate_id === selected.id)
-                  .map((a) => (
+                {selectedArtifacts.map((a) => (
                     <a key={a.id} href={api + "/files/" + a.path} download>
                       {a.kind.toUpperCase()} をダウンロード
                     </a>
                   ))}
-                {artifacts
-                  .filter((a) => a.candidate_id === selected.id && a.kind === "rigged_glb")
+                {selectedArtifacts
+                  .filter((a) => a.kind === "rigged_glb" || /^unity_lod[0-2]_glb$/.test(a.kind) || a.kind === "template_motion_glb")
                   .map((a) => (
                     <button key={a.id} className={rigPreviewPath === a.path ? "on" : ""} onClick={() => setRigPreviewPath(rigPreviewPath === a.path ? undefined : a.path)}>
-                      {rigPreviewPath === a.path ? "元モデルを表示" : "リグをプレビュー（骨格表示）"}
+                      {rigPreviewPath === a.path ? "元モデルを表示" : a.kind === "template_motion_glb" ? "テンプレートモーションをプレビュー" : a.kind.startsWith("unity_lod") ? `${a.kind.replace("unity_", "Unity ").toUpperCase()} をプレビュー（骨格表示）` : "リグをプレビュー（骨格表示）"}
                     </button>
                   ))}
               </div>

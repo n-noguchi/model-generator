@@ -69,6 +69,8 @@ class CreateRun(BaseModel):
 class EvaluationIn(BaseModel): geometry:int=Field(ge=1,le=5); texture:int=Field(ge=1,le=5); overall:int=Field(ge=1,le=5); verdict:str; comment:str=""
 class OptimizeIn(BaseModel): triangles:int=Field(20000,ge=500,le=200000); texture_size:Literal[1024,2048,4096]=2048; lod:bool=False; collision:bool=False; height_m:Optional[float]=Field(None,gt=0)
 class RigIn(BaseModel): target_triangles:int=Field(30000,ge=2000,le=100000)
+class GamePrepareIn(BaseModel): lod0_triangles:int=Field(30000,ge=4000,le=100000)
+class MotionIn(BaseModel): artifact_id:str; templates:list[Literal["Idle","Walk","Run","Jump","Wave"]]=["Idle","Walk","Run","Jump","Wave"]
 class WorkerUpdate(BaseModel): progress:Optional[int]=Field(None,ge=0,le=100); log:Optional[str]=None; error:Optional[str]=None
 class JobOut(BaseModel): model_config=ConfigDict(from_attributes=True); id:str; kind:str; run_id:Optional[str]; candidate_id:Optional[str]; payload:str; status:str; progress:int; log:str
 
@@ -190,6 +192,23 @@ def rig(candidate_id:str,body:RigIn,s:Session=Depends(db)):
     payload={"source_model_path":c.model_path,"source_sha256":source_hash,"target_triangles":body.target_triangles,
              "pipeline":"cleanup-decimate-auto-rig-auto-weights-v2"}
     j=Job(kind="rig",run_id=c.run_id,candidate_id=c.id,payload=json.dumps(payload));s.add(j);s.commit();return serialize(j)
+@app.post("/candidates/{candidate_id}/game-prepare")
+def game_prepare(candidate_id:str,body:GamePrepareIn,s:Session=Depends(db)):
+    """Build a non-destructive, Unity-oriented game asset package."""
+    c=get_or_404(s,Candidate,candidate_id)
+    if c.status != "completed" or not c.model_path or not abs_path(c.model_path).is_file():
+        raise HTTPException(409,"完了したGLB候補を選択してからゲーム用パッケージを作成してください")
+    source=abs_path(c.model_path)
+    payload={"source_model_path":c.model_path,"source_sha256":hashlib.sha256(source.read_bytes()).hexdigest(),
+             "lod0_triangles":body.lod0_triangles,"lod_ratios":[1.0,0.5,0.2],
+             "engine_profile":"unity-humanoid-manual-map-v1","pipeline":"game-prepare-v1"}
+    j=Job(kind="game_prepare",run_id=c.run_id,candidate_id=c.id,payload=json.dumps(payload));s.add(j);s.commit();return serialize(j)
+@app.post("/candidates/{candidate_id}/motions")
+def motions(candidate_id:str,body:MotionIn,s:Session=Depends(db)):
+    c=get_or_404(s,Candidate,candidate_id); a=get_or_404(s,Artifact,body.artifact_id)
+    if a.candidate_id != c.id or a.kind not in {"unity_lod0_glb","rigged_glb"} or not abs_path(a.path).is_file(): raise HTTPException(422,"同じ候補のリグ付きLOD0 GLBを選択してください")
+    source=abs_path(a.path); payload={"source_artifact_id":a.id,"source_model_path":a.path,"source_sha256":hashlib.sha256(source.read_bytes()).hexdigest(),"templates":body.templates,"pipeline":"procedural-template-motion-v1"}
+    j=Job(kind="motion_prepare",run_id=c.run_id,candidate_id=c.id,payload=json.dumps(payload));s.add(j);s.commit();return serialize(j)
 @app.post("/candidates/{candidate_id}/export")
 def export(candidate_id:str,formats:list[str],preset:str="Generic",s:Session=Depends(db)):
     c=get_or_404(s,Candidate,candidate_id)
@@ -219,7 +238,7 @@ def complete(job_id:str,result:dict,s:Session=Depends(db)):
     j=get_or_404(s,Job,job_id); j.status="completed";j.progress=100;j.log+="completed\n"
     c=get_or_404(s,Candidate,j.candidate_id) if j.candidate_id else None
     if j.kind=="generate" and c: c.status="completed";c.model_path=result.get("model_path");c.preview_path=result.get("preview_path");c.score=result.get("score")
-    if j.kind in {"export","rig"} and c:
+    if j.kind in {"export","rig","game_prepare","motion_prepare"} and c:
         for kind,path in result.get("artifacts",{}).items(): s.add(Artifact(candidate_id=c.id,kind=kind,path=path,metadata_json=json.dumps(result.get("metadata",{}))))
     if j.kind=="optimize" and c and result.get("model_path"): c.model_path=result["model_path"]
     sync_run_status(s,j.run_id);s.commit();return serialize(j)

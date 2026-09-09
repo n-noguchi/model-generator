@@ -8,9 +8,11 @@ data,candidate_id,kind,payload,result=Path(args[0]),args[1],args[2],json.loads(a
 def rel(path): return str(path.relative_to(data)).replace("\\","/")
 
 def load_model():
-    if kind == "rig":
+    if kind in {"rig", "game_prepare", "motion_prepare"}:
         source=data/payload["source_model_path"]
         if not source.is_file(): raise RuntimeError("fixed source model is missing")
+        actual_hash=__import__("hashlib").sha256(source.read_bytes()).hexdigest()
+        if actual_hash != payload["source_sha256"]: raise RuntimeError("入力モデルがジョブ作成後に変更されています。再実行してください")
     else:
         models=list((data/"projects").glob(f"*/runs/{candidate_id}/mesh.glb"))+list((data/"projects").glob(f"*/runs/{candidate_id}/model.obj"))
         if not models: raise RuntimeError("candidate model not found")
@@ -23,7 +25,7 @@ def load_model():
     return meshes, source
 
 def cleanup(meshes, target):
-    total=sum(len(o.data.polygons) for o in meshes); ratio=min(1.0, target/max(total,1))
+    total=sum(sum(max(0, len(face.vertices)-2) for face in o.data.polygons) for o in meshes); ratio=min(1.0, target/max(total,1))
     for obj in meshes:
         bpy.context.view_layer.objects.active=obj; obj.select_set(True)
         bpy.ops.object.mode_set(mode="EDIT"); bpy.ops.mesh.select_all(action="SELECT")
@@ -33,6 +35,36 @@ def cleanup(meshes, target):
             mod=obj.modifiers.new("Game budget decimation", "DECIMATE"); mod.ratio=ratio
             bpy.ops.object.modifier_apply(modifier=mod.name)
         obj.select_set(False)
+
+def triangle_count(meshes):
+    return sum(sum(max(0, len(face.vertices)-2) for face in obj.data.polygons) for obj in meshes)
+
+def skinned_meshes(arm):
+    return [o for o in bpy.context.scene.objects if o.type=="MESH" and any(m.type=="ARMATURE" and m.object==arm for m in o.modifiers)]
+
+def decimate_to(meshes, target):
+    total=triangle_count(meshes); ratio=min(1.0, target/max(total,1))
+    for obj in meshes:
+        mod=obj.modifiers.new("LOD decimation", "DECIMATE"); mod.ratio=ratio
+        bpy.context.view_layer.objects.active=obj; bpy.ops.object.modifier_apply(modifier=mod.name)
+
+def normalize_weights(meshes, arm):
+    """Make every skin vertex engine-safe: 1--4 finite, normalized influences."""
+    stats={"vertices":0,"pruned_influences":0,"normalized_vertices":0}
+    valid=set(b.name for b in arm.data.bones)
+    for obj in meshes:
+        groups={g.index:g for g in obj.vertex_groups}
+        for vertex in obj.data.vertices:
+            items=[(groups[x.group], x.weight) for x in vertex.groups if x.group in groups and groups[x.group].name in valid and x.weight > 1e-8]
+            if not items: raise RuntimeError("ウェイト無し頂点が検出されました。自動補完せず停止しました")
+            items.sort(key=lambda item:item[1], reverse=True)
+            kept=items[:4]; stats["pruned_influences"]+=len(items)-len(kept)
+            total=sum(weight for _,weight in kept)
+            if not total or not all(float(weight)==float(weight) for _,weight in kept): raise RuntimeError("無効なスキニングウェイトが検出されました")
+            for group,_ in items[4:]: group.remove([vertex.index])
+            for group,weight in kept: group.add([vertex.index], weight/total, "REPLACE")
+            stats["vertices"]+=1; stats["normalized_vertices"]+=1
+    return stats
 
 def make_humanoid_armature(meshes):
     points=[obj.matrix_world @ v.co for obj in meshes for v in obj.data.vertices]
@@ -92,9 +124,10 @@ def validate_skinning(meshes, arm):
         mod=next((m for m in obj.modifiers if m.type=="ARMATURE" and m.object==arm),None)
         if not mod or not obj.vertex_groups: raise RuntimeError("自動ウェイト検証に失敗しました")
         groups={g.index:g.name for g in obj.vertex_groups}
+        valid=set(b.name for b in arm.data.bones)
         for vertex in obj.data.vertices:
-            weights=[g.weight for g in vertex.groups]
-            if not weights or any(w < 0 for w in weights) or not all(float(w)==float(w) for w in weights):
+            weights=[g.weight for g in vertex.groups if groups.get(g.group) in valid]
+            if not weights or len(weights)>4 or any(w < 0 for w in weights) or not all(float(w)==float(w) for w in weights) or abs(sum(weights)-1.0)>1e-3:
                 raise RuntimeError("無効なスキニングウェイトが検出されました")
             for assignment in vertex.groups:
                 name=groups.get(assignment.group)
@@ -105,15 +138,130 @@ def validate_skinning(meshes, arm):
         raise RuntimeError("自動ウェイトが必須関節に割り当てられませんでした: " + ", ".join(missing))
     return totals
 
-def rig(meshes):
-    cleanup(meshes, payload["target_triangles"])
+def rig(meshes, target_triangles=None):
+    cleanup(meshes, target_triangles if target_triangles is not None else payload["target_triangles"])
     arm=make_humanoid_armature(meshes)
     bpy.ops.object.select_all(action="DESELECT")
     for obj in meshes: obj.select_set(True)
     arm.select_set(True); bpy.context.view_layer.objects.active=arm
     try: bpy.ops.object.parent_set(type="ARMATURE_AUTO")
     except RuntimeError as exc: raise RuntimeError("自動ウェイトの計算に失敗しました。腕を自然に下げた直立全身画像で再生成してください") from exc
-    return arm, validate_skinning(meshes, arm)
+    correction=normalize_weights(meshes, arm)
+    return arm, {"correction":correction,"coverage":validate_skinning(meshes, arm)}
+
+UNITY_HUMANOID_MAP={"Hips":"Hips","Spine":"Spine","Chest":"Chest","Neck":"Neck","Head":"Head","UpperArm.L":"LeftUpperArm","LowerArm.L":"LeftLowerArm","Hand.L":"LeftHand","UpperArm.R":"RightUpperArm","LowerArm.R":"RightLowerArm","Hand.R":"RightHand","UpperLeg.L":"LeftUpperLeg","LowerLeg.L":"LeftLowerLeg","Foot.L":"LeftFoot","UpperLeg.R":"RightUpperLeg","LowerLeg.R":"RightLowerLeg","Foot.R":"RightFoot"}
+
+def export_and_validate(root, label):
+    glb=root/f"{label}.glb"; fbx=root/f"{label}.fbx"
+    bpy.ops.export_scene.gltf(filepath=str(glb),export_format="GLB")
+    # Unity can import this FBX without depending on the worker's /data path.
+    # COPY + embed_textures keeps the source GLB material images inside the FBX.
+    bpy.ops.export_scene.fbx(filepath=str(fbx),use_armature_deform_only=True,path_mode="COPY",embed_textures=True)
+    bpy.ops.wm.read_factory_settings(use_empty=True); bpy.ops.import_scene.gltf(filepath=str(glb))
+    arm=next((o for o in bpy.context.scene.objects if o.type=="ARMATURE"),None)
+    meshes=skinned_meshes(arm) if arm else []
+    if not arm or not meshes: raise RuntimeError(f"{label}: GLBのリグ検証に失敗しました")
+    validation={"triangles":triangle_count(meshes),"skinning":validate_skinning(meshes,arm)}
+    bpy.ops.wm.read_factory_settings(use_empty=True); bpy.ops.import_scene.fbx(filepath=str(fbx))
+    fbx_arm=next((o for o in bpy.context.scene.objects if o.type=="ARMATURE"),None)
+    fbx_meshes=skinned_meshes(fbx_arm) if fbx_arm else []
+    if not fbx_arm or not fbx_meshes: raise RuntimeError(f"{label}: FBXのリグ検証に失敗しました")
+    validate_skinning(fbx_meshes,fbx_arm)
+    if not any(image.size[0] > 0 and image.size[1] > 0 for image in bpy.data.images): raise RuntimeError(f"{label}: FBXのテクスチャ検証に失敗しました")
+    return {"glb":rel(glb),"fbx":rel(fbx),**validation,"fbx_validated":True}
+
+def game_prepare(meshes):
+    cleanup(meshes, payload["lod0_triangles"])
+    arm, skinning=rig(meshes, payload["lod0_triangles"]); root=result.parent
+    points=[obj.matrix_world @ vertex.co for obj in meshes for vertex in obj.data.vertices]
+    low=[min(point[i] for point in points) for i in range(3)]; high=[max(point[i] for point in points) for i in range(3)]
+    height=max(high[2]-low[2], .01); radius=max((high[0]-low[0])*.5, (high[1]-low[1])*.5, height*.06)
+    radius=min(radius, height*.49)
+    collision={"shape":"capsule","axis":"Y","radius":radius,"height":max(height, radius*2),"center":[(low[0]+high[0])*.5,(low[1]+high[1])*.5,(low[2]+high[2])*.5],"unity":"モデルに CapsuleCollider または CharacterController を一方だけ追加し、この値を入力してください。"}
+    collision_path=root/"unity-collision.json"; collision_path.write_text(json.dumps(collision,ensure_ascii=False,indent=2),encoding="utf-8")
+    blend=root/"unity-editable.blend"; bpy.ops.wm.save_as_mainfile(filepath=str(blend))
+    package={"lod0":export_and_validate(root,"unity-lod0")}
+    # Re-import each preceding LOD so lower LODs retain exactly the same rig.
+    for label, ratio in (("lod1", payload["lod_ratios"][1]),("lod2", payload["lod_ratios"][2])):
+        arm=next(o for o in bpy.context.scene.objects if o.type=="ARMATURE"); meshes=skinned_meshes(arm)
+        decimate_to(meshes, max(1, round(payload["lod0_triangles"]*ratio)))
+        normalize_weights(meshes, arm)
+        validate_skinning(meshes, arm)
+        package[label]=export_and_validate(root, f"unity-{label}")
+    manifest={"pipeline":payload["pipeline"],"engine_profile":payload["engine_profile"],"source_model_path":payload["source_model_path"],"source_sha256":payload["source_sha256"],"unity_humanoid_map":UNITY_HUMANOID_MAP,"lods":package,"lod0_skinning":skinning,"warning":"UnityではFBX Import Settings の Rig を Humanoid にし、Humanoid Configure でこの対応表を確認してください。"}
+    manifest_path=root/"unity-manifest.json"; manifest_path.write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding="utf-8")
+    artifacts={"unity_lod0_glb":package["lod0"]["glb"],"unity_lod0_fbx":package["lod0"]["fbx"],"unity_lod1_glb":package["lod1"]["glb"],"unity_lod1_fbx":package["lod1"]["fbx"],"unity_lod2_glb":package["lod2"]["glb"],"unity_lod2_fbx":package["lod2"]["fbx"],"unity_editable_blend":rel(blend),"unity_manifest":rel(manifest_path),"unity_collision":rel(collision_path)}
+    json.dump({"artifacts":artifacts,"metadata":{"pipeline":payload["pipeline"],"validated":True,"engine_profile":payload["engine_profile"]}},result.open("w"))
+
+def motion_prepare():
+    arm=next((obj for obj in bpy.context.scene.objects if obj.type=="ARMATURE"),None)
+    meshes=skinned_meshes(arm) if arm else []
+    if not arm or not meshes: raise RuntimeError("モーション入力にリグ付きメッシュがありません")
+    for template in payload["templates"]:
+        action=bpy.data.actions.new(template); action.use_fake_user=True
+        frames=48 if template in {"Walk","Run"} else 32
+        targets=[("UpperArm.L",1),("UpperArm.R",-1),("UpperLeg.L",-1),("UpperLeg.R",1)]
+        if template=="Wave": targets=[("UpperArm.R",1),("LowerArm.R",1)]
+        if template=="Idle": targets=[("Chest",1)]
+        if template=="Jump": targets=[("UpperLeg.L",-1),("UpperLeg.R",-1),("LowerLeg.L",1),("LowerLeg.R",1)]
+        for name, sign in targets:
+            bone=arm.pose.bones.get(name)
+            if not bone: continue
+            bone.rotation_mode="XYZ"; path=f'pose.bones["{name}"].rotation_euler'
+            curve=action.fcurves.new(path,index=0); amplitude=0.12 if template=="Idle" else 0.55 if template in {"Walk","Run"} else 0.8
+            curve.keyframe_points.insert(1,0); curve.keyframe_points.insert(frames//2,sign*amplitude); curve.keyframe_points.insert(frames,0)
+        track=arm.animation_data_create().nla_tracks.new(); track.name=template; track.strips.new(template,1,action)
+    root=result.parent; glb=root/"template-motions.glb"; fbx=root/"template-motions.fbx"
+    bpy.ops.export_scene.gltf(filepath=str(glb),export_format="GLB",export_animations=True,export_nla_strips=True)
+    bpy.ops.export_scene.fbx(filepath=str(fbx),bake_anim=True,path_mode="COPY",embed_textures=True)
+    def validate_motion_file(path, importer, label):
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+        importer(filepath=str(path))
+        imported_arm=next((obj for obj in bpy.context.scene.objects if obj.type=="ARMATURE"),None)
+        imported_meshes=skinned_meshes(imported_arm) if imported_arm else []
+        if not imported_arm or not imported_meshes:
+            raise RuntimeError(f"{label}: モーションのリグ検証に失敗しました")
+        actions=list(bpy.data.actions)
+        # Importers qualify animation names differently: FBX stores the
+        # armature's take as "AutoRig|Walk", while Blender's GLB importer
+        # appends the target object as "Walk_AutoRig".  Do not match generic
+        # suffixes: FBX also imports mesh/world takes with the same template
+        # name, which do not animate the armature.
+        def action_for(template):
+            names={template, f"{imported_arm.name}|{template}", f"{template}_{imported_arm.name}"}
+            matches=[action for action in actions if action.name in names]
+            if len(matches) > 1:
+                raise RuntimeError(f"{label}: {template} に対応するモーションクリップが複数あります")
+            return matches[0] if matches else None
+        clips={template:action_for(template) for template in payload["templates"]}
+        missing=[template for template,action in clips.items() if action is None]
+        if missing:
+            raise RuntimeError(f"{label}: モーションクリップがありません: " + ", ".join(missing))
+        validate_skinning(imported_meshes, imported_arm)
+        if not any(image.size[0] > 0 and image.size[1] > 0 for image in bpy.data.images):
+            raise RuntimeError(f"{label}: テクスチャ検証に失敗しました")
+        # Evaluate each imported action independently.  Checking actions alone
+        # is not enough: a clip with unmapped bone tracks exports but never moves
+        # the skinned geometry in a viewer or engine.
+        imported_arm.animation_data_create()
+        for track in list(imported_arm.animation_data.nla_tracks):
+            imported_arm.animation_data.nla_tracks.remove(track)
+        depsgraph=bpy.context.evaluated_depsgraph_get()
+        for template in payload["templates"]:
+            action=clips[template]
+            start,end=action.frame_range
+            imported_arm.animation_data.action=action
+            bpy.context.scene.frame_set(round(start))
+            before=[obj.matrix_world @ vertex.co for obj in imported_meshes for vertex in obj.evaluated_get(depsgraph).data.vertices]
+            bpy.context.scene.frame_set(round((start+end)/2))
+            after=[obj.matrix_world @ vertex.co for obj in imported_meshes for vertex in obj.evaluated_get(depsgraph).data.vertices]
+            if len(before) != len(after) or not any((a-b).length > 1e-5 for a,b in zip(before,after)):
+                raise RuntimeError(f"{label}: {template} でメッシュ変形を確認できません")
+        return {"clips":payload["templates"],"mesh_deformation_validated":True}
+    validation={"glb":validate_motion_file(glb,bpy.ops.import_scene.gltf,"template-motions.glb"),
+                "fbx":validate_motion_file(fbx,bpy.ops.import_scene.fbx,"template-motions.fbx")}
+    manifest=root/"motion-manifest.json"; manifest.write_text(json.dumps({"templates":payload["templates"],"warning":"手続き的テンプレートです。足接地IK・自由文モーション生成は含みません。"},ensure_ascii=False,indent=2),encoding="utf-8")
+    json.dump({"artifacts":{"template_motion_glb":rel(glb),"template_motion_fbx":rel(fbx),"motion_manifest":rel(manifest)},"metadata":{"pipeline":payload["pipeline"],"validated":True,"motion_validation":validation}},result.open("w"))
 
 meshes, source=load_model()
 if kind=="optimize":
@@ -133,6 +281,10 @@ elif kind=="rig":
     exported_skinning=validate_skinning(exported_meshes, exported_arm)
     report=root/"report.json"; report.write_text(json.dumps({"source_model_path":payload["source_model_path"],"source_sha256":payload["source_sha256"],"target_triangles":payload["target_triangles"],"skinning":exported_skinning,"warning":"自動骨配置・自動ウェイトです。ゲーム投入前に関節変形を必ず確認してください。"},ensure_ascii=False,indent=2),encoding="utf-8")
     json.dump({"artifacts":{"rigged_glb":rel(glb),"rigged_fbx":rel(fbx),"editable_blend":rel(blend),"rig_report":rel(report)},"metadata":{"pipeline":payload["pipeline"],"source_sha256":payload["source_sha256"],"validated":True}},result.open("w"))
+elif kind=="game_prepare":
+    game_prepare(meshes)
+elif kind=="motion_prepare":
+    motion_prepare()
 else:
     artifacts={}; formats=payload["formats"]
     if "glb" in formats:
