@@ -205,7 +205,7 @@ function Camera({ preset, multiview }: { preset: string; multiview: boolean }) {
   }, [camera, preset, multiview]);
   return null;
 }
-function Viewer({ candidate, multiview = false, modelPath, rigPreview = false, motionPreview = false }: { candidate?: Candidate; multiview?: boolean; modelPath?: string; rigPreview?: boolean; motionPreview?: boolean }) {
+function Viewer({ candidate, multiview = false, modelPath, rigPreview = false, motionPreview = false, fallbackToCandidate = true, emptyMessage }: { candidate?: Candidate; multiview?: boolean; modelPath?: string; rigPreview?: boolean; motionPreview?: boolean; fallbackToCandidate?: boolean; emptyMessage?: string }) {
   const [mode, setMode] = useState("solid"),
     [texture, setTexture] = useState(true),
     [preset, setPreset] = useState("front"),
@@ -216,14 +216,14 @@ function Viewer({ candidate, multiview = false, modelPath, rigPreview = false, m
     [loop, setLoop] = useState(true),
     [speed, setSpeed] = useState(1),
     [restart, setRestart] = useState(0);
-  const path = modelPath || candidate?.model_path;
+  const path = modelPath || (fallbackToCandidate ? candidate?.model_path : undefined);
   useEffect(() => { setPose("rest"); setAnimationNames([]); setClip(""); setPlaying(true); }, [path]);
   useEffect(() => { if (motionPreview && !clip && animationNames[0]) setClip(animationNames[0]); }, [motionPreview, clip, animationNames]);
   const animation = motionPreview && clip ? { clip, playing, loop, speed, restart } : undefined;
   if (!path)
     return (
       <div className="viewer empty">
-        完了した候補を選択すると3Dプレビューを表示します。
+        {emptyMessage || "完了した候補を選択すると3Dプレビューを表示します。"}
       </div>
     );
   return (
@@ -282,6 +282,13 @@ function Viewer({ candidate, multiview = false, modelPath, rigPreview = false, m
       </div>
     </ViewerBoundary>
   );
+}
+function JobProgress({ job, emptyMessage }: { job?: Job; emptyMessage: string }) {
+  if (!job) return <p className="muted">{emptyMessage}</p>;
+  return <div className="job-list"><div><b>{job.kind}</b><span className={"badge state-" + job.status}>{job.status}</span><progress max="100" value={job.progress} /><span>{job.progress}%</span>{job.log && <small>{job.log}</small>}</div></div>;
+}
+function ArtifactLinks({ artifacts, emptyMessage }: { artifacts: Artifact[]; emptyMessage: string }) {
+  return artifacts.length ? <div className="artifact-links">{artifacts.map((artifact) => <a key={artifact.id} href={api + "/files/" + artifact.path} download>{artifact.kind.toUpperCase()}</a>)}</div> : <p className="muted">{emptyMessage}</p>;
 }
 function FileCard({
   view,
@@ -388,8 +395,8 @@ function App() {
     [lod, setLod] = useState(false),
     [collision, setCollision] = useState(false),
     [height, setHeight] = useState("");
-  const [rigPreviewPath, setRigPreviewPath] = useState<string>();
-  useEffect(() => setRigPreviewPath(undefined), [selected?.id]);
+  const [unityPreviewKind, setUnityPreviewKind] = useState("unity_lod0_glb");
+  useEffect(() => setUnityPreviewKind("unity_lod0_glb"), [selected?.id]);
   const fail = (e: unknown) =>
     setError(e instanceof Error ? e.message : "操作に失敗しました");
   const setFile = (key: ViewKey, file?: File) =>
@@ -527,9 +534,24 @@ function App() {
   const selectedJobs = selected
     ? (run?.jobs || []).filter((job) => job.candidate_id === selected.id && job.kind !== "generate")
     : [];
-  const latestCompletedGameJob = [...selectedJobs].reverse().find((job) => job.kind === "game_prepare" && job.status === "completed");
+  // 同じ処理を再実行してもSTEP 5が過去の成果物で埋まらないよう、種類ごとに最新の1件だけを表示する。
+  const latestSelectedJobs = selectedJobs.filter((job, index) => !selectedJobs.slice(index + 1).some((newer) => newer.kind === job.kind));
+  // 実行中・失敗の再試行で、直前に成功した成果物が消えないよう、成果物は種類ごとの最新成功ジョブから選ぶ。
+  const latestCompletedSelectedJobs = selectedJobs.filter((job, index) => job.status === "completed" && !selectedJobs.slice(index + 1).some((newer) => newer.kind === job.kind && newer.status === "completed"));
+  const latestArtifacts = selectedArtifacts.filter((artifact) => latestCompletedSelectedJobs.some((job) => artifact.path.includes(`/${job.id}/`)));
+  const latestRiggedGlb = latestArtifacts.find((artifact) => artifact.kind === "rigged_glb");
+  const rigArtifacts = latestArtifacts.filter((artifact) => artifact.kind.startsWith("rigged_") || artifact.kind === "editable_blend" || artifact.kind === "rig_report");
+  const unityPreviewArtifacts = ["unity_lod0_glb", "unity_lod1_glb", "unity_lod2_glb"]
+    .map((kind) => latestArtifacts.find((artifact) => artifact.kind === kind))
+    .filter((artifact): artifact is Artifact => !!artifact);
+  const selectedUnityPreview = unityPreviewArtifacts.find((artifact) => artifact.kind === unityPreviewKind) || unityPreviewArtifacts[0];
+  const latestMotionGlb = latestArtifacts.find((artifact) => artifact.kind === "template_motion_glb");
+  const unityArtifacts = latestArtifacts.filter((artifact) => artifact.kind.startsWith("unity_"));
+  const motionArtifacts = latestArtifacts.filter((artifact) => artifact.kind.startsWith("template_motion_") || artifact.kind === "motion_manifest");
+  const exportArtifacts = latestArtifacts.filter((artifact) => ["glb", "fbx", "zip"].includes(artifact.kind));
+  const latestCompletedGameJob = latestCompletedSelectedJobs.find((job) => job.kind === "game_prepare");
   const latestUnityLod0 = latestCompletedGameJob
-    ? selectedArtifacts.find((artifact) => artifact.kind === "unity_lod0_glb" && artifact.path.includes(`/${latestCompletedGameJob.id}/`))
+    ? latestArtifacts.find((artifact) => artifact.kind === "unity_lod0_glb" && artifact.path.includes(`/${latestCompletedGameJob.id}/`))
     : undefined;
   const canCreateMotion = !!latestUnityLod0 && selected?.status === "completed";
   const motionBlockedReason = !selected || selected.status !== "completed"
@@ -767,7 +789,7 @@ function App() {
                 <h2>候補の選択</h2>
               </div>
             </div>
-            <p className="muted">ゲーム向けの処理、進捗、リグ・モーションのプレビューは次のSTEP 5にまとめています。</p>
+            <p className="muted">候補モデルを確認して選択します。以降の各STEPでは、開始・進捗・成果物プレビューをその場で確認できます。</p>
             <Viewer candidate={selected} multiview={run.run.generation_mode === "multiview"} />
             <div className="grid">
               {candidates.map((c) => (
@@ -843,15 +865,12 @@ function App() {
               <div className="section-title">
                 <div>
                   <p className="step">STEP 5</p>
-                  <h2>ゲーム向け成果物</h2>
+                  <h2>メッシュ最適化（任意）</h2>
                 </div>
               </div>
-              <p className="muted">選択中: Candidate {selected.number}。ここでゲーム向け処理の開始、進捗確認、成果物のダウンロードとプレビューを完結できます。自動リグ・Unityパッケージ・モーションは元候補を変更しません。</p>
-              <div className="game-workspace">
-                <article className="game-card">
-                  <h3>1. メッシュ最適化（任意）</h3>
-                  <p>候補の表示モデルを指定ポリゴン数へ置き換えます。元の候補モデルを上書きするため、必要な場合だけ実行してください。</p>
-                  <p className="setting-note"><strong>共通の目標ポリゴン数:</strong> ここで選ぶ数値は、最適化だけでなく次の自動リグとUnity LOD0の目標にも使われます。</p>
+              <p className="muted">選択中: Candidate {selected.number}。候補の表示モデルを指定ポリゴン数へ置き換えます。元の候補を上書きするため、必要な場合だけ実行してください。</p>
+              <article className="game-card">
+                <p className="setting-note"><strong>共通の目標ポリゴン数:</strong> ここで選ぶ数値は、次の自動リグとUnity LOD0の目標にも使われます。</p>
               <div className="optimize">
                 {[5000, 10000, 20000, 50000].map((n) => (
                   <button
@@ -926,11 +945,26 @@ function App() {
                 >
                   最適化
                 </button>
+              </div>
+              </article>
+              <div className="process-layout">
+                <div>
+                  <h3>進捗</h3>
+                  <JobProgress job={latestSelectedJobs.find((job) => job.kind === "optimize")} emptyMessage="まだ最適化を実行していません。" />
                 </div>
+                <article className="preview-card">
+                  <h3>現在の候補プレビュー</h3>
+                  <Viewer candidate={selected} multiview={run.run.generation_mode === "multiview"} />
                 </article>
-                <article className="game-card">
-                  <h3>2. リグ付きモデルを作成</h3>
-                  <p>上の共通目標ポリゴン数で、基本人体骨格と自動ウェイトを別成果物として作成します。腕を自然に下げた直立全身モデル向けです。</p>
+              </div>
+            </section>
+          )}
+          {selected && (
+            <section>
+              <div className="section-title"><div><p className="step">STEP 6</p><h2>リグ付きモデルを作成</h2></div></div>
+              <p className="muted">基本人体骨格と自動ウェイトを別成果物として作成します。開始・進捗・プレビューをこのSTEPで確認できます。</p>
+              <div className="process-layout">
+                <div>
                 <button
                   disabled={selected.status !== "completed" || loading}
                   onClick={() =>
@@ -943,10 +977,24 @@ function App() {
                 >
                   自動リグ・スキニング（別成果物）
                 </button>
+                  <h3>進捗</h3>
+                  <JobProgress job={latestSelectedJobs.find((job) => job.kind === "rig")} emptyMessage="まだリグを作成していません。" />
+                  <h3>ダウンロード</h3>
+                  <ArtifactLinks artifacts={rigArtifacts} emptyMessage="完了後、ここにリグ成果物が表示されます。" />
+                </div>
+                <article className="preview-card">
+                  <h3>リグ付きモデルのプレビュー</h3>
+                  <Viewer candidate={selected} multiview={run.run.generation_mode === "multiview"} modelPath={latestRiggedGlb?.path} rigPreview={!!latestRiggedGlb} fallbackToCandidate={false} emptyMessage="リグ付きモデルを作成すると、ここに表示されます。" />
                 </article>
-                <article className="game-card">
-                  <h3>3. Unity用ゲームパッケージ</h3>
-                  <p>上の共通目標ポリゴン数をLOD0に使用し、LOD0 / 1 / 2、FBX、Humanoid対応表、Capsule Collider設定を出力します。</p>
+              </div>
+            </section>
+          )}
+          {selected && (
+            <section>
+              <div className="section-title"><div><p className="step">STEP 7</p><h2>Unity用ゲームパッケージ</h2></div></div>
+              <p className="muted">LOD0 / 1 / 2、FBX、Humanoid対応表、Capsule Collider設定を出力します。</p>
+              <div className="process-layout">
+                <div>
                 <button
                   disabled={selected.status !== "completed" || loading}
                   onClick={() =>
@@ -959,10 +1007,25 @@ function App() {
                 >
                   Unity用ゲームパッケージ（LOD0/1/2）
                 </button>
+                  <h3>進捗</h3>
+                  <JobProgress job={latestSelectedJobs.find((job) => job.kind === "game_prepare")} emptyMessage="まだUnity用ゲームパッケージを作成していません。" />
+                  <h3>ダウンロード</h3>
+                  <ArtifactLinks artifacts={unityArtifacts} emptyMessage="完了後、ここにUnity成果物が表示されます。" />
+                </div>
+                <article className="preview-card">
+                  <h3>Unityモデルのプレビュー</h3>
+                  {unityPreviewArtifacts.length > 0 && <div className="preview-tabs" role="group" aria-label="Unity LODを選択">{unityPreviewArtifacts.map((artifact) => <button key={artifact.id} aria-pressed={selectedUnityPreview?.id === artifact.id} className={selectedUnityPreview?.id === artifact.id ? "on" : ""} onClick={() => setUnityPreviewKind(artifact.kind)}>{artifact.kind.replace("unity_", "").replace("_glb", "").toUpperCase()}</button>)}</div>}
+                  <Viewer candidate={selected} multiview={run.run.generation_mode === "multiview"} modelPath={selectedUnityPreview?.path} rigPreview={!!selectedUnityPreview} fallbackToCandidate={false} emptyMessage="Unity用ゲームパッケージを作成すると、ここに表示されます。" />
                 </article>
-                <article className="game-card">
-                  <h3>4. テンプレートモーション</h3>
-                  <p>Idle / Walk / Run / Jump / Wave を、最新のUnity LOD0から生成します。</p>
+              </div>
+            </section>
+          )}
+          {selected && (
+            <section>
+              <div className="section-title"><div><p className="step">STEP 8</p><h2>テンプレートモーション</h2></div></div>
+              <p className="muted">Idle / Walk / Run / Jump / Wave を、最新のUnity LOD0から生成します。</p>
+              <div className="process-layout">
+                <div>
                 <button
                   disabled={!canCreateMotion}
                   onClick={() => {
@@ -972,10 +1035,22 @@ function App() {
                   テンプレートモーション生成（Idle / Walk / Run / Jump / Wave）
                 </button>
                 {!canCreateMotion && <p className="blocked-reason" role="status">生成できない理由: {motionBlockedReason}</p>}
+                  <h3>進捗</h3>
+                  <JobProgress job={latestSelectedJobs.find((job) => job.kind === "motion_prepare")} emptyMessage="まだテンプレートモーションを生成していません。" />
+                  <h3>ダウンロード</h3>
+                  <ArtifactLinks artifacts={motionArtifacts} emptyMessage="完了後、ここにモーション成果物が表示されます。" />
+                </div>
+                <article className="preview-card">
+                  <h3>テンプレートモーションのプレビュー</h3>
+                  <Viewer candidate={selected} multiview={run.run.generation_mode === "multiview"} modelPath={latestMotionGlb?.path} rigPreview={!!latestMotionGlb} motionPreview={!!latestMotionGlb} fallbackToCandidate={false} emptyMessage="テンプレートモーションを生成すると、ここに表示されます。" />
                 </article>
-                <article className="game-card">
-                  <h3>5. 汎用エクスポート</h3>
-                  <p>選択中候補をGLB / FBX / ZIPとして書き出します。</p>
+              </div>
+            </section>
+          )}
+          {selected && (
+            <section>
+              <div className="section-title"><div><p className="step">STEP 9</p><h2>汎用エクスポート</h2></div></div>
+              <p className="muted">選択中候補をGLB / FBX / ZIPとして書き出します。</p>
                 <button
                   onClick={() =>
                     void action(
@@ -990,33 +1065,11 @@ function App() {
                 >
                   GLB / FBX / ZIP Export
                 </button>
-                </article>
-              </div>
-              <div className="game-results">
-                <div>
-                  <h3>ゲーム向け処理の進捗</h3>
-                  {selectedJobs.length ? <div className="job-list">{selectedJobs.map((j) => (
-                    <div key={j.id}><b>{j.kind}</b><span className={"badge state-" + j.status}>{j.status}</span><progress max="100" value={j.progress} /><span>{j.progress}%</span>{j.log && <small>{j.log}</small>}</div>
-                  ))}</div> : <p className="muted">この候補では、まだゲーム向け処理を開始していません。</p>}
-                </div>
-                <div>
-                  <h3>リグ・モーションのプレビュー</h3>
-                  <Viewer candidate={selected} multiview={run.run.generation_mode === "multiview"} modelPath={rigPreviewPath} rigPreview={!!rigPreviewPath} motionPreview={selectedArtifacts.some((a) => a.path === rigPreviewPath && a.kind === "template_motion_glb")} />
-                </div>
-              </div>
-              <div className="downloads">
-                {selectedArtifacts.map((a) => (
-                    <a key={a.id} href={api + "/files/" + a.path} download>
-                      {a.kind.toUpperCase()} をダウンロード
-                    </a>
-                  ))}
-                {selectedArtifacts
-                  .filter((a) => a.kind === "rigged_glb" || /^unity_lod[0-2]_glb$/.test(a.kind) || a.kind === "template_motion_glb")
-                  .map((a) => (
-                    <button key={a.id} className={rigPreviewPath === a.path ? "on" : ""} onClick={() => setRigPreviewPath(rigPreviewPath === a.path ? undefined : a.path)}>
-                      {rigPreviewPath === a.path ? "元モデルを表示" : a.kind === "template_motion_glb" ? "テンプレートモーションをプレビュー" : a.kind.startsWith("unity_lod") ? `${a.kind.replace("unity_", "Unity ").toUpperCase()} をプレビュー（骨格表示）` : "リグをプレビュー（骨格表示）"}
-                    </button>
-                  ))}
+              <div className="export-status">
+                <h3>進捗</h3>
+                <JobProgress job={latestSelectedJobs.find((job) => job.kind === "export")} emptyMessage="まだ汎用エクスポートを実行していません。" />
+                <h3>ダウンロード</h3>
+                <ArtifactLinks artifacts={exportArtifacts} emptyMessage="完了後、ここにGLB / FBX / ZIPが表示されます。" />
               </div>
             </section>
           )}

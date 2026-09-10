@@ -1,5 +1,6 @@
 """Blender post-processing jobs. Rig output is always a separate artifact."""
 import bpy, json, sys, shutil, statistics
+from mathutils import Vector, Quaternion
 from pathlib import Path
 
 args=sys.argv[sys.argv.index("--")+1:]
@@ -29,7 +30,8 @@ def cleanup(meshes, target):
     for obj in meshes:
         bpy.context.view_layer.objects.active=obj; obj.select_set(True)
         bpy.ops.object.mode_set(mode="EDIT"); bpy.ops.mesh.select_all(action="SELECT")
-        bpy.ops.mesh.remove_doubles(threshold=0.0001); bpy.ops.mesh.normals_make_consistent(inside=False)
+        bpy.ops.mesh.remove_doubles(threshold=0.0001)
+        bpy.ops.mesh.normals_make_consistent(inside=False)
         bpy.ops.object.mode_set(mode="OBJECT")
         if ratio < .999:
             mod=obj.modifiers.new("Game budget decimation", "DECIMATE"); mod.ratio=ratio
@@ -66,6 +68,79 @@ def normalize_weights(meshes, arm):
             stats["vertices"]+=1; stats["normalized_vertices"]+=1
     return stats
 
+def limit_limb_weight_bleed(meshes, arm):
+    """Remove only clearly remote limb weights before normalizing.
+
+    Automatic heat weights can occasionally reach through a connected torso or
+    pelvis surface.  A shoulder/hip needs blended weights, so this uses the
+    distance to each limb bone segment rather than a hard body-side cut.  A
+    remote influence is removed only when the vertex retains another valid
+    influence; this never creates an unweighted vertex.
+    """
+    limb_names=("UpperArm.L","LowerArm.L","Hand.L","UpperArm.R","LowerArm.R","Hand.R",
+                "UpperLeg.L","LowerLeg.L","Foot.L","UpperLeg.R","LowerLeg.R","Foot.R")
+    points=[obj.matrix_world @ vertex.co for obj in meshes for vertex in obj.data.vertices]
+    if not points: return {"removed":0,"retained_only_influence":0}
+    height=max(point.z for point in points)-min(point.z for point in points)
+    segments={}
+    for name in limb_names:
+        bone=arm.data.bones.get(name)
+        if not bone: continue
+        start=arm.matrix_world @ bone.head_local; end=arm.matrix_world @ bone.tail_local
+        length=max((end-start).length, height*.025)
+        # Keep a shoulder/hip blending zone, while excluding the torso/pelvis
+        # centre from a limb several bone-widths away.
+        segments[name]=(start,end,max(length*.60,height*.07))
+    def distance_to_segment(point, start, end):
+        vector=end-start; length_sq=vector.length_squared
+        if length_sq <= 1e-12: return (point-start).length
+        factor=max(0.0,min(1.0,(point-start).dot(vector)/length_sq))
+        return (point-(start+vector*factor)).length
+    stats={"removed":0,"retained_only_influence":0}
+    valid=set(bone.name for bone in arm.data.bones)
+    for obj in meshes:
+        groups={group.index:group for group in obj.vertex_groups}
+        for vertex in obj.data.vertices:
+            items=[(groups[item.group],item.weight) for item in vertex.groups if item.group in groups and groups[item.group].name in valid and item.weight > 1e-8]
+            remote=[]
+            point=obj.matrix_world @ vertex.co
+            for group,weight in items:
+                segment=segments.get(group.name)
+                if segment and distance_to_segment(point,*segment[:2]) > segment[2]: remote.append((group,weight))
+            if not remote: continue
+            remaining=sum(weight for group,weight in items if (group,weight) not in remote)
+            if remaining <= 1e-8:
+                stats["retained_only_influence"]+=len(remote)
+                continue
+            for group,_ in remote:
+                group.remove([vertex.index]); stats["removed"]+=1
+    return stats
+
+def remove_cross_limb_weights(meshes, arm):
+    """Prevent an arm/leg from pulling the other branch through a close pose.
+
+    Downward hands can sit next to thighs, so proximity alone cannot identify
+    their ownership.  When one branch already has at least 70% of a vertex's
+    valid skinning weight, discard only the other branch's minority weights.
+    The conservative threshold keeps genuine hip/shoulder trunk blending.
+    """
+    arms={"UpperArm.L","LowerArm.L","Hand.L","UpperArm.R","LowerArm.R","Hand.R"}
+    legs={"UpperLeg.L","LowerLeg.L","Foot.L","UpperLeg.R","LowerLeg.R","Foot.R"}
+    valid=set(bone.name for bone in arm.data.bones); removed=0
+    for obj in meshes:
+        groups={group.index:group for group in obj.vertex_groups}
+        for vertex in obj.data.vertices:
+            items=[(groups[item.group],item.weight) for item in vertex.groups if item.group in groups and groups[item.group].name in valid and item.weight > 1e-8]
+            arm_weight=sum(weight for group,weight in items if group.name in arms)
+            leg_weight=sum(weight for group,weight in items if group.name in legs)
+            if arm_weight >= .70 and leg_weight > 0:
+                for group,_ in items:
+                    if group.name in legs: group.remove([vertex.index]); removed+=1
+            elif leg_weight >= .70 and arm_weight > 0:
+                for group,_ in items:
+                    if group.name in arms: group.remove([vertex.index]); removed+=1
+    return {"removed":removed}
+
 def make_humanoid_armature(meshes):
     points=[obj.matrix_world @ v.co for obj in meshes for v in obj.data.vertices]
     low=[min(p[i] for p in points) for i in range(3)]; high=[max(p[i] for p in points) for i in range(3)]
@@ -100,6 +175,12 @@ def make_humanoid_armature(meshes):
         elbow=outer_limb_point(side,.59,side*width*.42)
         wrist=outer_limb_point(side,.43,side*width*.45)
         hand=outer_limb_point(side,.34,side*width*.45)
+        # At hand height the outer silhouette can be a nearby thigh.  Do not
+        # let the terminal hand bone turn sharply back through the body.
+        if (hand[0]-center[0])*side < (wrist[0]-center[0])*side-width*.03:
+            hand=(wrist[0]+(wrist[0]-elbow[0])*.55,
+                  wrist[1]+(wrist[1]-elbow[1])*.55,
+                  wrist[2]+(wrist[2]-elbow[2])*.55)
         spec += [(f"UpperArm.{tag}",shoulder,elbow,"Chest"),
                  (f"LowerArm.{tag}",elbow,wrist,f"UpperArm.{tag}"),
                  (f"Hand.{tag}",wrist,hand,f"LowerArm.{tag}"),
@@ -146,8 +227,10 @@ def rig(meshes, target_triangles=None):
     arm.select_set(True); bpy.context.view_layer.objects.active=arm
     try: bpy.ops.object.parent_set(type="ARMATURE_AUTO")
     except RuntimeError as exc: raise RuntimeError("自動ウェイトの計算に失敗しました。腕を自然に下げた直立全身画像で再生成してください") from exc
+    cross_branch=remove_cross_limb_weights(meshes, arm)
+    bleed=limit_limb_weight_bleed(meshes, arm)
     correction=normalize_weights(meshes, arm)
-    return arm, {"correction":correction,"coverage":validate_skinning(meshes, arm)}
+    return arm, {"correction":correction,"cross_limb_weight":cross_branch,"limb_weight_bleed":bleed,"coverage":validate_skinning(meshes, arm)}
 
 UNITY_HUMANOID_MAP={"Hips":"Hips","Spine":"Spine","Chest":"Chest","Neck":"Neck","Head":"Head","UpperArm.L":"LeftUpperArm","LowerArm.L":"LeftLowerArm","Hand.L":"LeftHand","UpperArm.R":"RightUpperArm","LowerArm.R":"RightLowerArm","Hand.R":"RightHand","UpperLeg.L":"LeftUpperLeg","LowerLeg.L":"LeftLowerLeg","Foot.L":"LeftFoot","UpperLeg.R":"RightUpperLeg","LowerLeg.R":"RightLowerLeg","Foot.R":"RightFoot"}
 
@@ -185,6 +268,8 @@ def game_prepare(meshes):
     for label, ratio in (("lod1", payload["lod_ratios"][1]),("lod2", payload["lod_ratios"][2])):
         arm=next(o for o in bpy.context.scene.objects if o.type=="ARMATURE"); meshes=skinned_meshes(arm)
         decimate_to(meshes, max(1, round(payload["lod0_triangles"]*ratio)))
+        remove_cross_limb_weights(meshes, arm)
+        limit_limb_weight_bleed(meshes, arm)
         normalize_weights(meshes, arm)
         validate_skinning(meshes, arm)
         package[label]=export_and_validate(root, f"unity-{label}")
@@ -201,15 +286,38 @@ def motion_prepare():
         action=bpy.data.actions.new(template); action.use_fake_user=True
         frames=48 if template in {"Walk","Run"} else 32
         targets=[("UpperArm.L",1),("UpperArm.R",-1),("UpperLeg.L",-1),("UpperLeg.R",1)]
-        if template=="Wave": targets=[("UpperArm.R",1),("LowerArm.R",1)]
+        if template=="Wave": targets=[("UpperArm.R",1),("LowerArm.R",1),("Hand.R",1)]
         if template=="Idle": targets=[("Chest",1)]
         if template=="Jump": targets=[("UpperLeg.L",-1),("UpperLeg.R",-1),("LowerLeg.L",1),("LowerLeg.R",1)]
         for name, sign in targets:
             bone=arm.pose.bones.get(name)
             if not bone: continue
-            bone.rotation_mode="XYZ"; path=f'pose.bones["{name}"].rotation_euler'
-            curve=action.fcurves.new(path,index=0); amplitude=0.12 if template=="Idle" else 0.55 if template in {"Walk","Run"} else 0.8
-            curve.keyframe_points.insert(1,0); curve.keyframe_points.insert(frames//2,sign*amplitude); curve.keyframe_points.insert(frames,0)
+            # Rotation mode belongs to the pose bone, not to an Action.  Keep
+            # every generated clip in Quaternion form so switching a Wave
+            # cannot invalidate the Euler tracks of Walk/Run.
+            bone.rotation_mode="QUATERNION"
+            if template=="Wave":
+                rest=bone.bone.matrix_local.to_3x3()
+                # The generated rig is Z-up in world space.  Convert its
+                # forward axis through the armature and rest transforms.
+                body_axis=arm.matrix_world.to_3x3().inverted() @ Vector((0,1,0))
+                local_axis=(rest.inverted() @ body_axis).normalized()
+            else:
+                # Preserve the existing gait/jump bending convention while
+                # representing it as a Quaternion rather than Euler curves.
+                local_axis=Vector((1,0,0))
+            amplitude=0.12 if template=="Idle" else 0.55 if template in {"Walk","Run"} else 0.8
+            if template=="Wave":
+                # Small body-forward Wave rotations avoid pulling a down-arm
+                # through the torso regardless of the generated bone roll.
+                amplitude={"UpperArm.R":.16,"LowerArm.R":.32,"Hand.R":.18}[name]
+            path=f'pose.bones["{name}"].rotation_quaternion'
+            curves=[]
+            for index,value in enumerate((1,0,0,0)):
+                curve=action.fcurves.new(path,index=index); curves.append(curve)
+                curve.keyframe_points.insert(1,value); curve.keyframe_points.insert(frames,value)
+            rotation=Quaternion(local_axis,sign*amplitude)
+            for curve,value in zip(curves,rotation): curve.keyframe_points.insert(frames//2,value)
         track=arm.animation_data_create().nla_tracks.new(); track.name=template; track.strips.new(template,1,action)
     root=result.parent; glb=root/"template-motions.glb"; fbx=root/"template-motions.fbx"
     bpy.ops.export_scene.gltf(filepath=str(glb),export_format="GLB",export_animations=True,export_nla_strips=True)

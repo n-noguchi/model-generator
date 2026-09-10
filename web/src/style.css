@@ -390,6 +390,57 @@ progress {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
 }
+.process-layout {
+  display: grid;
+  grid-template-columns: minmax(260px, .7fr) minmax(0, 1.3fr);
+  gap: 16px;
+  align-items: start;
+}
+.process-layout > :first-child {
+  padding: 14px;
+  border: 1px solid #38506a;
+  border-radius: 10px;
+  background: #111b28;
+}
+.process-layout h3 {
+  margin: 18px 0 7px;
+}
+.process-layout h3:first-child {
+  margin-top: 0;
+}
+.process-layout .job-list > div {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+.process-layout .job-list progress {
+  grid-column: 1 / -1;
+  width: 100%;
+}
+.process-layout .job-list progress + span,
+.process-layout .job-list small {
+  grid-column: 1 / -1;
+}
+.artifact-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+.artifact-links a {
+  color: #a8d0ff;
+  font-size: .85rem;
+}
+.export-status {
+  margin-top: 18px;
+  padding: 14px;
+  border: 1px solid #38506a;
+  border-radius: 10px;
+  background: #111b28;
+}
+.export-status h3 {
+  margin: 18px 0 7px;
+}
+.export-status h3:first-child {
+  margin-top: 0;
+}
 .game-card {
   padding: 15px;
   border: 1px solid #38506a;
@@ -425,15 +476,62 @@ progress {
   line-height: 1.4;
 }
 .game-results {
-  display: grid;
-  grid-template-columns: minmax(280px, .85fr) minmax(0, 1.15fr);
-  gap: 16px;
   margin-top: 20px;
   padding-top: 20px;
   border-top: 1px solid #304155;
 }
 .game-results .job-list {
   margin-top: 0;
+}
+.preview-section {
+  margin-top: 22px;
+  padding-top: 20px;
+  border-top: 1px solid #304155;
+}
+.preview-section > .muted {
+  margin: 4px 0 14px;
+}
+.game-previews {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+.preview-card {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid #38506a;
+  border-radius: 10px;
+  background: #111b28;
+}
+.preview-card h4 {
+  margin: 0 0 9px;
+}
+.preview-card .viewer-toolbar {
+  margin: 0 0 8px;
+}
+.preview-card .viewer {
+  height: 255px;
+}
+.preview-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 9px;
+}
+.preview-tabs button {
+  padding: 6px 9px;
+  font-size: .82rem;
+}
+.artifact-downloads {
+  display: block;
+}
+.artifact-downloads h3 {
+  margin: 0 0 8px;
+}
+.artifact-downloads > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
 }
 .error {
   background: #55232b;
@@ -471,7 +569,8 @@ pre {
   .grid,
   .generation-mode,
   .game-workspace,
-  .game-results {
+  .game-previews,
+  .process-layout {
     grid-template-columns: 1fr;
   }
   .generate {
