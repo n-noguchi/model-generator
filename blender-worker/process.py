@@ -2,6 +2,10 @@
 import bpy, json, sys, shutil, statistics
 from mathutils import Vector, Quaternion
 from pathlib import Path
+# Blender --python does not add the script's directory to Python's import path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from attachment_diagnostics import write_diagnostics
+from limb_separation import separate_contacts
 
 args=sys.argv[sys.argv.index("--")+1:]
 data,candidate_id,kind,payload,result=Path(args[0]),args[1],args[2],json.loads(args[3]),Path(args[4])
@@ -166,27 +170,61 @@ def make_humanoid_armature(meshes):
         edge=band[:max(4, len(band)//8)]
         return (statistics.median(p[0] for p in edge), statistics.median(p[1] for p in edge), target)
 
+    def leg_axis_point(side, z, fallback_x):
+        """Estimate a leg centerline independently of the arm-span width.
+
+        A T-pose makes the global X extent mostly arms.  Using that extent for
+        the hips placed leg bones outside the thighs.  At calf/ankle heights a
+        side-specific median is robust to the front/back surface vertices and
+        remains local to the actual leg.
+        """
+        half_band=height*.035; target=low[2]+z*height
+        band=[p for p in points if abs(p[2]-target) <= half_band and (p[0]-center[0])*side > height*.018]
+        if len(band) < 8: return pos(fallback_x, 0, z)
+        return (statistics.median(p[0] for p in band), statistics.median(p[1] for p in band), target)
+
+    def tpose_arm(side):
+        """Build a horizontal arm chain from upper-body cross sections."""
+        chest=[p for p in points if low[2]+height*.60 <= p[2] <= low[2]+height*.68]
+        torso=sorted(abs(p[0]-center[0]) for p in chest)
+        torso_half=torso[min(len(torso)-1, int(len(torso)*.85))] if len(torso) >= 16 else height*.13
+        arm_points=[p for p in points if low[2]+height*.62 <= p[2] <= low[2]+height*.88 and (p[0]-center[0])*side > torso_half*.8]
+        if len(arm_points) < 16: raise RuntimeError("Tポーズの腕領域を検出できませんでした。腕を肩の高さで左右へ伸ばした4方向画像で再生成してください")
+        xs=sorted((p[0]-center[0])*side for p in arm_points)
+        outer=xs[max(0, int(len(xs)*.92)-1)]
+        shoulder=max(torso_half*.92, height*.10)
+        if outer-shoulder < height*.16: raise RuntimeError("Tポーズの腕の長さを確認できませんでした。腕を胴体から離してください")
+        wrist=outer-height*.075; elbow=shoulder+(wrist-shoulder)*.52
+        def point_at(offset):
+            near=[p for p in arm_points if abs((p[0]-center[0])*side-offset) <= height*.025]
+            if not near: return (center[0]+side*offset, center[1], low[2]+height*.76)
+            return (center[0]+side*offset, statistics.median(p[1] for p in near), statistics.median(p[2] for p in near))
+        shoulder_point=point_at(shoulder)
+        # The inner shoulder slice also contains the chest/underarm wall.  Use
+        # only the adjacent outer upper-arm band for its Y/Z centerline.
+        upper=[p for p in arm_points if shoulder+height*.04 <= (p[0]-center[0])*side <= elbow-height*.03]
+        if len(upper) >= 6:
+            shoulder_point=(shoulder_point[0], statistics.median(p[1] for p in upper), statistics.median(p[2] for p in upper))
+        return shoulder_point,point_at(elbow),point_at(wrist),point_at(outer)
+
     spec=[("Hips",pos(0,0,.48),pos(0,0,.58),None), ("Spine",pos(0,0,.58),pos(0,0,.70),"Hips"),
           ("Chest",pos(0,0,.70),pos(0,0,.80),"Spine"), ("Neck",pos(0,0,.80),pos(0,0,.86),"Chest"),
           ("Head",pos(0,0,.86),pos(0,0,.98),"Neck")]
     for side in (-1,1):
         tag="L" if side>0 else "R"
-        shoulder=outer_limb_point(side,.77,side*width*.28)
-        elbow=outer_limb_point(side,.59,side*width*.42)
-        wrist=outer_limb_point(side,.43,side*width*.45)
-        hand=outer_limb_point(side,.34,side*width*.45)
-        # At hand height the outer silhouette can be a nearby thigh.  Do not
-        # let the terminal hand bone turn sharply back through the body.
-        if (hand[0]-center[0])*side < (wrist[0]-center[0])*side-width*.03:
-            hand=(wrist[0]+(wrist[0]-elbow[0])*.55,
-                  wrist[1]+(wrist[1]-elbow[1])*.55,
-                  wrist[2]+(wrist[2]-elbow[2])*.55)
+        shoulder,elbow,wrist,hand=tpose_arm(side)
+        ankle=leg_axis_point(side,.06,side*height*.07)
+        knee=leg_axis_point(side,.27,side*height*.07)
+        # Waist/garment hems widen the .49 cross-section; use the upper-thigh
+        # centerline and extend it to the anatomical hip height instead.
+        thigh_axis=leg_axis_point(side,.39,side*height*.07)
+        hip=(thigh_axis[0], thigh_axis[1], low[2]+height*.49)
         spec += [(f"UpperArm.{tag}",shoulder,elbow,"Chest"),
                  (f"LowerArm.{tag}",elbow,wrist,f"UpperArm.{tag}"),
                  (f"Hand.{tag}",wrist,hand,f"LowerArm.{tag}"),
-                 (f"UpperLeg.{tag}",pos(side*width*.22,0,.49),pos(side*width*.27,0,.27),"Hips"),
-                 (f"LowerLeg.{tag}",pos(side*width*.27,0,.27),pos(side*width*.27,0,.06),f"UpperLeg.{tag}"),
-                 (f"Foot.{tag}",pos(side*width*.27,0,.06),pos(side*width*.27,-height*.08,.02),f"LowerLeg.{tag}")]
+                 (f"UpperLeg.{tag}",hip,knee,"Hips"),
+                 (f"LowerLeg.{tag}",knee,ankle,f"UpperLeg.{tag}"),
+                 (f"Foot.{tag}",ankle,(ankle[0],ankle[1]-height*.08,low[2]+height*.02),f"LowerLeg.{tag}")]
     bpy.ops.object.armature_add(enter_editmode=True, location=(0,0,0)); arm=bpy.context.object; arm.name="AutoRig"
     bpy.ops.armature.select_all(action="SELECT"); bpy.ops.armature.delete()
     bones={}
@@ -226,11 +264,18 @@ def rig(meshes, target_triangles=None):
     for obj in meshes: obj.select_set(True)
     arm.select_set(True); bpy.context.view_layer.objects.active=arm
     try: bpy.ops.object.parent_set(type="ARMATURE_AUTO")
-    except RuntimeError as exc: raise RuntimeError("自動ウェイトの計算に失敗しました。腕を自然に下げた直立全身画像で再生成してください") from exc
+    except RuntimeError as exc: raise RuntimeError("自動ウェイトの計算に失敗しました。腕を肩の高さで伸ばし、脚を離したTポーズの4方向画像で再生成してください") from exc
     cross_branch=remove_cross_limb_weights(meshes, arm)
     bleed=limit_limb_weight_bleed(meshes, arm)
     correction=normalize_weights(meshes, arm)
-    return arm, {"correction":correction,"cross_limb_weight":cross_branch,"limb_weight_bleed":bleed,"coverage":validate_skinning(meshes, arm)}
+    separation=separate_contacts(meshes, arm)
+    # New cap-center vertices receive interpolated weights; normalize only
+    # after a successful topology change. Failed/uncertain repairs are already
+    # restored by separate_contacts.
+    if separation["status"] == "separated": normalize_weights(meshes, arm)
+    return arm, {"correction":correction,"cross_limb_weight":cross_branch,
+                 "limb_weight_bleed":bleed,"separation":separation,
+                 "coverage":validate_skinning(meshes, arm)}
 
 UNITY_HUMANOID_MAP={"Hips":"Hips","Spine":"Spine","Chest":"Chest","Neck":"Neck","Head":"Head","UpperArm.L":"LeftUpperArm","LowerArm.L":"LeftLowerArm","Hand.L":"LeftHand","UpperArm.R":"RightUpperArm","LowerArm.R":"RightLowerArm","Hand.R":"RightHand","UpperLeg.L":"LeftUpperLeg","LowerLeg.L":"LeftLowerLeg","Foot.L":"LeftFoot","UpperLeg.R":"RightUpperLeg","LowerLeg.R":"RightLowerLeg","Foot.R":"RightFoot"}
 
@@ -245,13 +290,14 @@ def export_and_validate(root, label):
     meshes=skinned_meshes(arm) if arm else []
     if not arm or not meshes: raise RuntimeError(f"{label}: GLBのリグ検証に失敗しました")
     validation={"triangles":triangle_count(meshes),"skinning":validate_skinning(meshes,arm)}
+    diagnostics={key:rel(path) for key,path in write_diagnostics(meshes,arm,glb,root,label.replace("-","_")).items()}
     bpy.ops.wm.read_factory_settings(use_empty=True); bpy.ops.import_scene.fbx(filepath=str(fbx))
     fbx_arm=next((o for o in bpy.context.scene.objects if o.type=="ARMATURE"),None)
     fbx_meshes=skinned_meshes(fbx_arm) if fbx_arm else []
     if not fbx_arm or not fbx_meshes: raise RuntimeError(f"{label}: FBXのリグ検証に失敗しました")
     validate_skinning(fbx_meshes,fbx_arm)
     if not any(image.size[0] > 0 and image.size[1] > 0 for image in bpy.data.images): raise RuntimeError(f"{label}: FBXのテクスチャ検証に失敗しました")
-    return {"glb":rel(glb),"fbx":rel(fbx),**validation,"fbx_validated":True}
+    return {"glb":rel(glb),"fbx":rel(fbx),**validation,"fbx_validated":True,"diagnostics":diagnostics}
 
 def game_prepare(meshes):
     cleanup(meshes, payload["lod0_triangles"])
@@ -262,6 +308,8 @@ def game_prepare(meshes):
     radius=min(radius, height*.49)
     collision={"shape":"capsule","axis":"Y","radius":radius,"height":max(height, radius*2),"center":[(low[0]+high[0])*.5,(low[1]+high[1])*.5,(low[2]+high[2])*.5],"unity":"モデルに CapsuleCollider または CharacterController を一方だけ追加し、この値を入力してください。"}
     collision_path=root/"unity-collision.json"; collision_path.write_text(json.dumps(collision,ensure_ascii=False,indent=2),encoding="utf-8")
+    separation_path=root/"unity-separation-report.json"
+    separation_path.write_text(json.dumps(skinning["separation"],ensure_ascii=False,indent=2),encoding="utf-8")
     blend=root/"unity-editable.blend"; bpy.ops.wm.save_as_mainfile(filepath=str(blend))
     package={"lod0":export_and_validate(root,"unity-lod0")}
     # Re-import each preceding LOD so lower LODs retain exactly the same rig.
@@ -275,13 +323,27 @@ def game_prepare(meshes):
         package[label]=export_and_validate(root, f"unity-{label}")
     manifest={"pipeline":payload["pipeline"],"engine_profile":payload["engine_profile"],"source_model_path":payload["source_model_path"],"source_sha256":payload["source_sha256"],"unity_humanoid_map":UNITY_HUMANOID_MAP,"lods":package,"lod0_skinning":skinning,"warning":"UnityではFBX Import Settings の Rig を Humanoid にし、Humanoid Configure でこの対応表を確認してください。"}
     manifest_path=root/"unity-manifest.json"; manifest_path.write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding="utf-8")
-    artifacts={"unity_lod0_glb":package["lod0"]["glb"],"unity_lod0_fbx":package["lod0"]["fbx"],"unity_lod1_glb":package["lod1"]["glb"],"unity_lod1_fbx":package["lod1"]["fbx"],"unity_lod2_glb":package["lod2"]["glb"],"unity_lod2_fbx":package["lod2"]["fbx"],"unity_editable_blend":rel(blend),"unity_manifest":rel(manifest_path),"unity_collision":rel(collision_path)}
+    artifacts={"unity_lod0_glb":package["lod0"]["glb"],"unity_lod0_fbx":package["lod0"]["fbx"],"unity_lod1_glb":package["lod1"]["glb"],"unity_lod1_fbx":package["lod1"]["fbx"],"unity_lod2_glb":package["lod2"]["glb"],"unity_lod2_fbx":package["lod2"]["fbx"],"unity_editable_blend":rel(blend),"unity_manifest":rel(manifest_path),"unity_collision":rel(collision_path),"unity_separation_report":rel(separation_path)}
+    for lod in package.values(): artifacts.update(lod["diagnostics"])
     json.dump({"artifacts":artifacts,"metadata":{"pipeline":payload["pipeline"],"validated":True,"engine_profile":payload["engine_profile"]}},result.open("w"))
 
 def motion_prepare():
     arm=next((obj for obj in bpy.context.scene.objects if obj.type=="ARMATURE"),None)
     meshes=skinned_meshes(arm) if arm else []
     if not arm or not meshes: raise RuntimeError("モーション入力にリグ付きメッシュがありません")
+    # The source rig is authored in T-pose.  Procedural locomotion must first
+    # establish a down-arm locomotion pose instead of treating T-pose as idle.
+    down_arm={}
+    for side in ("L", "R"):
+        bone=arm.pose.bones.get(f"UpperArm.{side}")
+        if bone:
+            rest=bone.bone.matrix_local.to_3x3()
+            # Keep a small lateral clearance from the torso throughout gait.
+            # This is a posture target, not a model-specific coordinate hack.
+            side_sign=1 if side == "L" else -1
+            down_outward=Vector((side_sign*.13,0,-1)).normalized()
+            target=arm.matrix_world.to_3x3().inverted() @ down_outward
+            down_arm[bone.name]=Vector((0,1,0)).rotation_difference((rest.inverted() @ target).normalized())
     for template in payload["templates"]:
         action=bpy.data.actions.new(template); action.use_fake_user=True
         frames=48 if template in {"Walk","Run"} else 32
@@ -296,32 +358,45 @@ def motion_prepare():
             # every generated clip in Quaternion form so switching a Wave
             # cannot invalidate the Euler tracks of Walk/Run.
             bone.rotation_mode="QUATERNION"
+            baseline=down_arm.get(name, Quaternion()) if template in {"Walk","Run"} else Quaternion()
             if template=="Wave":
                 rest=bone.bone.matrix_local.to_3x3()
                 # The generated rig is Z-up in world space.  Convert its
                 # forward axis through the armature and rest transforms.
                 body_axis=arm.matrix_world.to_3x3().inverted() @ Vector((0,1,0))
                 local_axis=(rest.inverted() @ body_axis).normalized()
+            elif name.startswith("UpperArm.") and template in {"Walk","Run"}:
+                # Swing around the body's left/right axis.  Convert through
+                # both the rest basis and the down-arm baseline: the result is
+                # a forward/back swing after lowering the T-pose arm.
+                rest=bone.bone.matrix_local.to_3x3()
+                body_lateral=arm.matrix_world.to_3x3().inverted() @ Vector((1,0,0))
+                local_axis=(baseline.inverted() @ (rest.inverted() @ body_lateral)).normalized()
             else:
                 # Preserve the existing gait/jump bending convention while
                 # representing it as a Quaternion rather than Euler curves.
                 local_axis=Vector((1,0,0))
-            amplitude=0.12 if template=="Idle" else 0.55 if template in {"Walk","Run"} else 0.8
+            amplitude=0.12 if template=="Idle" else .38 if template in {"Walk","Run"} else 0.8
             if template=="Wave":
                 # Small body-forward Wave rotations avoid pulling a down-arm
                 # through the torso regardless of the generated bone roll.
                 amplitude={"UpperArm.R":.16,"LowerArm.R":.32,"Hand.R":.18}[name]
             path=f'pose.bones["{name}"].rotation_quaternion'
             curves=[]
-            for index,value in enumerate((1,0,0,0)):
+            for index,value in enumerate(baseline):
                 curve=action.fcurves.new(path,index=index); curves.append(curve)
                 curve.keyframe_points.insert(1,value); curve.keyframe_points.insert(frames,value)
-            rotation=Quaternion(local_axis,sign*amplitude)
-            for curve,value in zip(curves,rotation): curve.keyframe_points.insert(frames//2,value)
+            rotation=baseline @ Quaternion(local_axis,sign*amplitude)
+            reverse=baseline @ Quaternion(local_axis,-sign*amplitude)
+            middle=baseline if template in {"Walk","Run"} else rotation
+            for curve,value in zip(curves,middle): curve.keyframe_points.insert(frames//2,value)
+            for curve,value in zip(curves,rotation): curve.keyframe_points.insert(frames//4,value)
+            for curve,value in zip(curves,reverse): curve.keyframe_points.insert(frames*3//4,value)
         track=arm.animation_data_create().nla_tracks.new(); track.name=template; track.strips.new(template,1,action)
     root=result.parent; glb=root/"template-motions.glb"; fbx=root/"template-motions.fbx"
     bpy.ops.export_scene.gltf(filepath=str(glb),export_format="GLB",export_animations=True,export_nla_strips=True)
     bpy.ops.export_scene.fbx(filepath=str(fbx),bake_anim=True,path_mode="COPY",embed_textures=True)
+    diagnostics={}
     def validate_motion_file(path, importer, label):
         bpy.ops.wm.read_factory_settings(use_empty=True)
         importer(filepath=str(path))
@@ -361,15 +436,20 @@ def motion_prepare():
             imported_arm.animation_data.action=action
             bpy.context.scene.frame_set(round(start))
             before=[obj.matrix_world @ vertex.co for obj in imported_meshes for vertex in obj.evaluated_get(depsgraph).data.vertices]
-            bpy.context.scene.frame_set(round((start+end)/2))
+            # Every template now has a periodic neutral midpoint; check a
+            # quarter phase where the actual template motion peaks.
+            sample=start+(end-start)*.25
+            bpy.context.scene.frame_set(round(sample))
             after=[obj.matrix_world @ vertex.co for obj in imported_meshes for vertex in obj.evaluated_get(depsgraph).data.vertices]
             if len(before) != len(after) or not any((a-b).length > 1e-5 for a,b in zip(before,after)):
                 raise RuntimeError(f"{label}: {template} でメッシュ変形を確認できません")
+        if path == glb:
+            diagnostics.update({key:rel(value) for key,value in write_diagnostics(imported_meshes,imported_arm,glb,root,"motion",include_actions=True).items()})
         return {"clips":payload["templates"],"mesh_deformation_validated":True}
     validation={"glb":validate_motion_file(glb,bpy.ops.import_scene.gltf,"template-motions.glb"),
                 "fbx":validate_motion_file(fbx,bpy.ops.import_scene.fbx,"template-motions.fbx")}
     manifest=root/"motion-manifest.json"; manifest.write_text(json.dumps({"templates":payload["templates"],"warning":"手続き的テンプレートです。足接地IK・自由文モーション生成は含みません。"},ensure_ascii=False,indent=2),encoding="utf-8")
-    json.dump({"artifacts":{"template_motion_glb":rel(glb),"template_motion_fbx":rel(fbx),"motion_manifest":rel(manifest)},"metadata":{"pipeline":payload["pipeline"],"validated":True,"motion_validation":validation}},result.open("w"))
+    json.dump({"artifacts":{"template_motion_glb":rel(glb),"template_motion_fbx":rel(fbx),"motion_manifest":rel(manifest),**diagnostics},"metadata":{"pipeline":payload["pipeline"],"validated":True,"motion_validation":validation}},result.open("w"))
 
 meshes, source=load_model()
 if kind=="optimize":
@@ -387,8 +467,9 @@ elif kind=="rig":
     exported_meshes=[o for o in bpy.context.scene.objects if o.type=="MESH" and any(m.type=="ARMATURE" and m.object==exported_arm for m in o.modifiers)]
     if not exported_arm or not exported_meshes: raise RuntimeError("rigged GLB validation failed")
     exported_skinning=validate_skinning(exported_meshes, exported_arm)
+    diagnostics={key:rel(value) for key,value in write_diagnostics(exported_meshes,exported_arm,glb,root,"rig").items()}
     report=root/"report.json"; report.write_text(json.dumps({"source_model_path":payload["source_model_path"],"source_sha256":payload["source_sha256"],"target_triangles":payload["target_triangles"],"skinning":exported_skinning,"warning":"自動骨配置・自動ウェイトです。ゲーム投入前に関節変形を必ず確認してください。"},ensure_ascii=False,indent=2),encoding="utf-8")
-    json.dump({"artifacts":{"rigged_glb":rel(glb),"rigged_fbx":rel(fbx),"editable_blend":rel(blend),"rig_report":rel(report)},"metadata":{"pipeline":payload["pipeline"],"source_sha256":payload["source_sha256"],"validated":True}},result.open("w"))
+    json.dump({"artifacts":{"rigged_glb":rel(glb),"rigged_fbx":rel(fbx),"editable_blend":rel(blend),"rig_report":rel(report),**diagnostics},"metadata":{"pipeline":payload["pipeline"],"source_sha256":payload["source_sha256"],"validated":True}},result.open("w"))
 elif kind=="game_prepare":
     game_prepare(meshes)
 elif kind=="motion_prepare":

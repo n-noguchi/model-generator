@@ -205,7 +205,29 @@ function Camera({ preset, multiview }: { preset: string; multiview: boolean }) {
   }, [camera, preset, multiview]);
   return null;
 }
-function Viewer({ candidate, multiview = false, modelPath, rigPreview = false, motionPreview = false, fallbackToCandidate = true, emptyMessage }: { candidate?: Candidate; multiview?: boolean; modelPath?: string; rigPreview?: boolean; motionPreview?: boolean; fallbackToCandidate?: boolean; emptyMessage?: string }) {
+function DiagnosticCamera({ path, preset, multiview }: { path: string; preset: string; multiview: boolean }) {
+  const { scene } = useGLTF(api + "/files/" + path);
+  const { camera, size, controls } = useThree();
+  const box = useMemo(() => new THREE.Box3().setFromObject(scene), [scene]);
+  useEffect(() => {
+    if (!(camera instanceof THREE.PerspectiveCamera) || box.isEmpty()) return;
+    const center = box.getCenter(new THREE.Vector3()), extent = box.getSize(new THREE.Vector3());
+    const halfFov = THREE.MathUtils.degToRad(camera.fov / 2);
+    const width = preset === "side" ? extent.z : extent.x;
+    const depth = preset === "side" ? extent.x : extent.z;
+    const distance = Math.max(extent.y / (2 * Math.tan(halfFov)), width / (2 * Math.tan(halfFov) * size.width / Math.max(size.height, 1))) * 1.25 + depth / 2;
+    const direction = preset === "side" ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 0, (preset === "front") === multiview ? 1 : -1);
+    camera.position.copy(center).addScaledVector(direction, distance);
+    camera.near = Math.max(distance / 1000, .0001);
+    camera.far = Math.max(distance * 100, 100);
+    camera.lookAt(center);
+    camera.updateProjectionMatrix();
+    const orbit = controls as unknown as { target?: THREE.Vector3; update?: () => void };
+    if (orbit?.target) { orbit.target.copy(center); orbit.update?.(); }
+  }, [box, camera, controls, preset, multiview, size.width, size.height]);
+  return null;
+}
+function Viewer({ candidate, multiview = false, modelPath, rigPreview = false, motionPreview = false, diagnostic = false, fallbackToCandidate = true, emptyMessage }: { candidate?: Candidate; multiview?: boolean; modelPath?: string; rigPreview?: boolean; motionPreview?: boolean; diagnostic?: boolean; fallbackToCandidate?: boolean; emptyMessage?: string }) {
   const [mode, setMode] = useState("solid"),
     [texture, setTexture] = useState(true),
     [preset, setPreset] = useState("front"),
@@ -227,16 +249,16 @@ function Viewer({ candidate, multiview = false, modelPath, rigPreview = false, m
       </div>
     );
   return (
-    <ViewerBoundary>
+    <ViewerBoundary key={path}>
       <div className="viewer-toolbar">
-        <label>
+        {!diagnostic && <label>
           表示{" "}
           <select value={mode} onChange={(e) => setMode(e.target.value)}>
             <option value="solid">Solid</option>
             <option value="wire">Wireframe</option>
             <option value="matcap">MatCap</option>
           </select>
-        </label>
+        </label>}
         {rigPreview && <span className="toolbar-note">緑の線: スキニングされた骨格</span>}
         {rigPreview && !motionPreview && <label>ポーズ確認 <select value={pose} onChange={(e) => setPose(e.target.value)}><option value="rest">レストポーズ</option><option value="arms">肩・肘テスト</option><option value="legs">股関節・膝テスト</option></select></label>}
         {motionPreview && <>
@@ -248,14 +270,14 @@ function Viewer({ candidate, multiview = false, modelPath, rigPreview = false, m
           <label>速度 <input aria-label="モーション再生速度" type="number" min="0.1" max="3" step="0.1" value={speed} onChange={(e) => setSpeed(Math.min(3, Math.max(.1, Number(e.target.value) || 1)))} /></label>
           {!animationNames.length && <span className="toolbar-note">モーションクリップを読み込み中です</span>}
         </>}
-        <label>
+        {!diagnostic && <label>
           <input
             type="checkbox"
             checked={texture}
             onChange={(e) => setTexture(e.target.checked)}
           />{" "}
           Texture
-        </label>
+        </label>}
         <span className="toolbar-note">
           3D表示方向（入力指定ではありません）
         </span>
@@ -270,18 +292,82 @@ function Viewer({ candidate, multiview = false, modelPath, rigPreview = false, m
         ))}
       </div>
       <div className="viewer">
-        <Canvas>
+        <Canvas gl={{ alpha: true }} style={{ background: "transparent" }}>
           <ambientLight intensity={1.5} />
           <directionalLight position={[3, 4, 3]} />
-          <Camera preset={preset} multiview={multiview} />
+          {!diagnostic && <Camera preset={preset} multiview={multiview} />}
           <React.Suspense fallback={<></>}>
+            {diagnostic && <DiagnosticCamera path={path} preset={preset} multiview={multiview} />}
             <Model path={path} mode={mode} texture={texture} showSkeleton={rigPreview} pose={pose} animation={animation} onAnimationNames={motionPreview ? setAnimationNames : undefined} />
           </React.Suspense>
-          <OrbitControls />
+          <OrbitControls makeDefault={diagnostic} />
         </Canvas>
       </div>
     </ViewerBoundary>
   );
+}
+type AttachmentReport = {
+  status: "candidates_found" | "no_candidates" | "not_evaluated";
+  source_file: string; candidate_faces: number; tested_poses: number; reason?: string;
+  regions: { mesh: string; face_count: number; cross_branch_faces: number; max_stretch: number; pose: string; branches: string[] }[];
+};
+type SeparationReport = { status: "separated" | "not_separated" | "unchanged" | "not_evaluated"; before_faces: number; after_faces: number; reason: string };
+function SeparationStatus({ source, artifacts }: { source?: Artifact; artifacts: Artifact[] }) {
+  const directory = source?.path.slice(0, source.path.lastIndexOf("/") + 1);
+  const file = directory ? artifacts.find((artifact) => artifact.kind === "unity_separation_report" && artifact.path.slice(0, artifact.path.lastIndexOf("/") + 1) === directory) : undefined;
+  const [report, setReport] = useState<SeparationReport>();
+  useEffect(() => {
+    const controller = new AbortController(); setReport(undefined);
+    if (file) void call("/files/" + file.path, { signal: controller.signal }).then((value: SeparationReport) => {
+      if (!controller.signal.aborted) setReport(value);
+    }).catch(() => { /* The download link remains available. */ });
+    return () => controller.abort();
+  }, [file?.path]);
+  if (!file) return null;
+  const summary = report?.status === "separated"
+    ? `自動分離済み: 検出候補 ${report.before_faces}面 → ${report.after_faces}面。`
+    : report ? `自動分離は安全条件により未変更です: ${report.reason}` : "自動分離の検証結果を読み込み中です…";
+  return <p className={report?.status === "separated" ? "success" : "muted"}>{summary} <a href={api + "/files/" + file.path} download>検証結果</a></p>;
+}
+function AttachmentDiagnostics({ source, artifacts, prefix, multiview }: { source?: Artifact; artifacts: Artifact[]; prefix: string; multiview: boolean }) {
+  // Source and diagnostics must belong to exactly the same job and LOD.
+  const directory = source?.path.slice(0, source.path.lastIndexOf("/") + 1);
+  const find = (suffix: string) => directory ? artifacts.find(a => a.kind === `${prefix}_attachment_${suffix}` && a.path.slice(0, a.path.lastIndexOf("/") + 1) === directory) : undefined;
+  const reportFile = find("report"), preview = find("preview");
+  const [state, setState] = useState<{ path?: string; report?: AttachmentReport; error?: string }>({});
+  useEffect(() => {
+    const controller = new AbortController();
+    setState({ path: reportFile?.path });
+    if (reportFile) {
+      void call("/files/" + reportFile.path, { signal: controller.signal }).then((report: AttachmentReport) => {
+        if (controller.signal.aborted) return;
+        if (report.source_file !== source?.path.split("/").pop() || !Array.isArray(report.regions) || !["candidates_found", "no_candidates", "not_evaluated"].includes(report.status)) throw Error("診断結果と表示モデルが一致しません");
+        setState({ path: reportFile.path, report });
+      }).catch((error: Error) => { if (!controller.signal.aborted) setState({ path: reportFile.path, error: error.message }); });
+    }
+    return () => controller.abort();
+  }, [reportFile?.path, source?.path]);
+  const report = state.path === reportFile?.path ? state.report : undefined;
+  const error = state.path === reportFile?.path ? state.error : undefined;
+  const names: Record<string, string> = { arm_L: "左腕", arm_R: "右腕", leg_L: "左脚", leg_R: "右脚", trunk: "胴体" };
+  return <article className="attachment-diagnostics">
+    <h3>癒着・ウェイト異常の候補</h3>
+    {!reportFile ? <p className="muted">未診断です。このSTEPを生成すると、候補箇所を自動検査します。</p> : error ? <p className="error">診断を読み込めません: {error}</p> : !report ? <p role="status">診断を読み込み中です…</p> : report.status === "not_evaluated" ? <p role="status">判定不可: {report.reason}</p> : <>
+      <p role="status">{report.status === "candidates_found" ? `${report.regions.length}領域・${report.candidate_faces.toLocaleString()}面に異常変形の候補があります。` : "検査条件に該当する候補はありません。癒着がないことの保証ではありません。"} {report.tested_poses}ポーズを検査済み。</p>
+      <p className="diagnostic-legend"><span className="risk-orange">橙: 異常な伸び</span> ／ <span className="risk-red">赤: 異常な伸び＋複数部位のウェイト</span> ／ 灰: 今回の検出対象外</p>
+      <div className="diagnostic-layout">
+        <Viewer key={preview?.path} modelPath={preview?.path} diagnostic multiview={multiview} fallbackToCandidate={false} emptyMessage="診断プレビューが見つかりません。再生成してください。" />
+        {report.regions.length > 0 && <div className="diagnostic-regions"><h4>検出理由（伸びが大きい順）</h4><ol>{report.regions.slice(0, 10).map((region, index) => <li key={index}>
+          <strong>領域 {index + 1}: 最大 {region.max_stretch.toFixed(1)}倍</strong>
+          <div>{region.face_count}面・{region.branches.map(name => names[name] || name).join(" / ") || "部位不明"}</div>
+          <div>{region.pose}</div>
+          <small>接続した面で異常な伸び{region.cross_branch_faces > 0 ? `。うち${region.cross_branch_faces}面に複数部位の影響` : ""}。</small>
+        </li>)}</ol>{report.regions.length > 10 && <p>残り{report.regions.length - 10}領域は診断JSONに記録しています。色付きプレビューは全候補を表示します。</p>}</div>}
+      </div>
+      <p className="muted">静止モデルに検出面を着色しています。癒着とウェイト誤りの確定・自動分離は行いません。画像との自動照合は未実施です。STEP 3の4方向画像と合わせて確認してください。</p>
+    </>}
+    {reportFile && <a href={api + "/files/" + reportFile.path} download>診断JSONをダウンロード</a>}
+  </article>;
 }
 function JobProgress({ job, emptyMessage }: { job?: Job; emptyMessage: string }) {
   if (!job) return <p className="muted">{emptyMessage}</p>;
@@ -546,7 +632,7 @@ function App() {
     .filter((artifact): artifact is Artifact => !!artifact);
   const selectedUnityPreview = unityPreviewArtifacts.find((artifact) => artifact.kind === unityPreviewKind) || unityPreviewArtifacts[0];
   const latestMotionGlb = latestArtifacts.find((artifact) => artifact.kind === "template_motion_glb");
-  const unityArtifacts = latestArtifacts.filter((artifact) => artifact.kind.startsWith("unity_"));
+  const unityArtifacts = latestArtifacts.filter((artifact) => artifact.kind.startsWith("unity_") && !artifact.kind.includes("_attachment_"));
   const motionArtifacts = latestArtifacts.filter((artifact) => artifact.kind.startsWith("template_motion_") || artifact.kind === "motion_manifest");
   const exportArtifacts = latestArtifacts.filter((artifact) => ["glb", "fbx", "zip"].includes(artifact.kind));
   const latestCompletedGameJob = latestCompletedSelectedJobs.find((job) => job.kind === "game_prepare");
@@ -622,6 +708,9 @@ function App() {
         <div className="input-notice">
           <strong>方向の基準:</strong> 左右は画面を見る側ではなく、
           <strong>人物本人から見た左右</strong>です。
+        </div>
+        <div className="input-notice pose-notice">
+          <strong>入力ポーズ（必須）:</strong> 4方向すべて<strong>Tポーズ</strong>（腕を肩の高さで左右へまっすぐ伸ばし、脚を離して直立）にしてください。手・腕・胴体や脚が重ならない写真を使うと、形状生成と自動リグの精度が上がります。
         </div>
         <div className="generation-mode">
           <strong>全身高品質（4方向）</strong>
@@ -987,6 +1076,7 @@ function App() {
                   <Viewer candidate={selected} multiview={run.run.generation_mode === "multiview"} modelPath={latestRiggedGlb?.path} rigPreview={!!latestRiggedGlb} fallbackToCandidate={false} emptyMessage="リグ付きモデルを作成すると、ここに表示されます。" />
                 </article>
               </div>
+              <AttachmentDiagnostics source={latestRiggedGlb} artifacts={latestArtifacts} prefix="rig" multiview={run.run.generation_mode === "multiview"} />
             </section>
           )}
           {selected && (
@@ -1018,6 +1108,8 @@ function App() {
                   <Viewer candidate={selected} multiview={run.run.generation_mode === "multiview"} modelPath={selectedUnityPreview?.path} rigPreview={!!selectedUnityPreview} fallbackToCandidate={false} emptyMessage="Unity用ゲームパッケージを作成すると、ここに表示されます。" />
                 </article>
               </div>
+              <SeparationStatus source={selectedUnityPreview} artifacts={latestArtifacts} />
+              <AttachmentDiagnostics source={selectedUnityPreview} artifacts={latestArtifacts} prefix={selectedUnityPreview?.kind.replace("_glb", "") || "unity_lod0"} multiview={run.run.generation_mode === "multiview"} />
             </section>
           )}
           {selected && (
@@ -1045,6 +1137,7 @@ function App() {
                   <Viewer candidate={selected} multiview={run.run.generation_mode === "multiview"} modelPath={latestMotionGlb?.path} rigPreview={!!latestMotionGlb} motionPreview={!!latestMotionGlb} fallbackToCandidate={false} emptyMessage="テンプレートモーションを生成すると、ここに表示されます。" />
                 </article>
               </div>
+              <AttachmentDiagnostics source={latestMotionGlb} artifacts={latestArtifacts} prefix="motion" multiview={run.run.generation_mode === "multiview"} />
             </section>
           )}
           {selected && (

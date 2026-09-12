@@ -14,5 +14,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # /opt/blender retains the official tarball's bundled license files.
 ENV PATH=/opt/blender:${PATH}
 WORKDIR /worker
-COPY worker.py process.py ./
+COPY worker.py process.py attachment_diagnostics.py limb_separation.py ./
 CMD ["python3", "worker.py"]

@@ -323,7 +323,14 @@ progress {
 }
 .viewer {
   height: 370px;
-  background: #070b10;
+  /* Mid-tone drafting grid keeps Solid, MatCap, and skeleton colors legible. */
+  background-color: #7b8796;
+  background-image:
+    linear-gradient(rgba(30, 44, 60, .20) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(30, 44, 60, .20) 1px, transparent 1px),
+    linear-gradient(rgba(255, 255, 255, .12) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, .12) 1px, transparent 1px);
+  background-size: 32px 32px, 32px 32px, 8px 8px, 8px 8px;
   border: 1px solid #2b3a4c;
   border-radius: 9px;
   overflow: hidden;
@@ -538,6 +545,10 @@ progress {
   padding: 10px;
   border-radius: 5px;
 }
+
+.success {
+  color: #68e2b8;
+}
 .warning {
   color: #ffd28a;
 }
@@ -590,3 +601,11 @@ pre {
     height: 300px;
   }
 }
+.attachment-diagnostics { margin-top: 1.25rem; padding: 1rem; border: 1px solid #41576b; border-radius: 12px; background: #111e2a; }
+.diagnostic-layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: .75rem; }
+.diagnostic-layout .viewer-toolbar { grid-column: 1; }
+.diagnostic-layout .viewer { grid-column: 1; }
+.diagnostic-regions { max-height: 360px; overflow: auto; }
+.diagnostic-regions li { margin-bottom: .8rem; }
+.risk-orange { color: #ffb047; }
+.risk-red { color: #ff6977; }
