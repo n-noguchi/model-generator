@@ -24,5 +24,5 @@ RUN git clone ${HUNYUAN3D_REPOSITORY} /opt/hunyuan3d-2 \
     && python -m venv --system-site-packages /opt/hunyuan-venv
 COPY sf3d-worker/requirements-hunyuan.txt /tmp/requirements-hunyuan.txt
 RUN /opt/hunyuan-venv/bin/pip install --no-cache-dir -r /tmp/requirements-hunyuan.txt
-COPY sf3d-worker/worker.py sf3d-worker/hunyuan_backend.py sf3d-worker/projection.py .
+COPY sf3d-worker/worker.py sf3d-worker/hunyuan_backend.py sf3d-worker/projection.py sf3d-worker/gpu_runtime.py .
 CMD ["python", "worker.py"]

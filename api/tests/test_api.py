@@ -82,7 +82,13 @@ def test_high_quality_run_status_and_health():
     project, paths = project_and_four_uploads()
     detail = create_high_quality_run(project, paths).json()
     job = detail["jobs"][0]
-    client.post(f"/worker/jobs/{job['id']}/start")
+    from app.main import Job, Sessions
+    with Sessions() as session:
+        for other in session.query(Job).all():
+            if other.id != job["id"]: other.status = "completed"
+        session.commit()
+    assert client.post("/worker/jobs/claim?kind=generate").json()["id"] == job["id"]
+    assert client.post(f"/worker/jobs/{job['id']}/start").status_code == 200
     assert client.get(f"/runs/{detail['run']['id']}").json()["run"]["status"] == "running"
     client.post(f"/worker/jobs/{job['id']}/update", json={"error": "broken"})
     assert client.get(f"/runs/{detail['run']['id']}").json()["candidates"][0]["status"] == "failed"

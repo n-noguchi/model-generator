@@ -43,3 +43,16 @@ services:
     volumes: [./data:/data]
     depends_on:
       api: {condition: service_healthy}
+  motion-worker:
+    build:
+      context: .
+      dockerfile: motion-worker/Dockerfile
+      additional_contexts:
+        blender_runtime: service:blender-worker
+    environment:
+      API_BASE_URL: http://api:8000
+      MOTION_MODEL_DIR: /models/mdm
+    volumes: [./data:/data, ./models/mdm:/models/mdm]
+    gpus: all
+    depends_on:
+      api: {condition: service_healthy}

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Literal, Optional
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, create_engine, inspect, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from PIL import Image, ImageChops
@@ -71,6 +71,18 @@ class OptimizeIn(BaseModel): triangles:int=Field(20000,ge=500,le=200000); textur
 class RigIn(BaseModel): target_triangles:int=Field(30000,ge=2000,le=100000)
 class GamePrepareIn(BaseModel): lod0_triangles:int=Field(30000,ge=4000,le=100000)
 class MotionIn(BaseModel): artifact_id:str; templates:list[Literal["Idle","Walk","Run","Jump","Wave"]]=["Idle","Walk","Run","Jump","Wave"]
+class TextMotionIn(BaseModel):
+    artifact_id: str
+    prompt: str = Field(min_length=3, max_length=240)
+    seconds: float = Field(4, ge=2, le=8, allow_inf_nan=False)
+    seed: int = Field(1234, ge=0, le=2147483647)
+    @field_validator("prompt")
+    @classmethod
+    def english_prompt(cls, value):
+        value=value.strip()
+        if len(value)<3 or not value.isascii() or not any(c.isalpha() for c in value) or any(ord(c)<32 for c in value):
+            raise ValueError("動作を短い英語の1文で入力してください（例: A person walks forward.）")
+        return value
 class WorkerUpdate(BaseModel): progress:Optional[int]=Field(None,ge=0,le=100); log:Optional[str]=None; error:Optional[str]=None
 class JobOut(BaseModel): model_config=ConfigDict(from_attributes=True); id:str; kind:str; run_id:Optional[str]; candidate_id:Optional[str]; payload:str; status:str; progress:int; log:str
 
@@ -214,19 +226,48 @@ def export(candidate_id:str,formats:list[str],preset:str="Generic",s:Session=Dep
     c=get_or_404(s,Candidate,candidate_id)
     if not set(formats)<= {"glb","fbx"} or not formats: raise HTTPException(422,"formats must contain glb and/or fbx")
     j=Job(kind="export",run_id=c.run_id,candidate_id=c.id,payload=json.dumps({"formats":formats,"preset":preset}));s.add(j);s.commit();return serialize(j)
+
+@app.get("/text-motion/status")
+def text_motion_status():
+    path=DATA/"text-motion-status.json"
+    try:
+        status=json.loads(path.read_text())
+        if now().timestamp()-path.stat().st_mtime < 30: return status
+    except (OSError, ValueError): pass
+    return {"ready":False,"message":"ローカルモーションワーカーの起動・モデル準備を待っています。"}
+
+@app.post("/candidates/{candidate_id}/text-motions")
+def text_motions(candidate_id:str,body:TextMotionIn,s:Session=Depends(db)):
+    c=get_or_404(s,Candidate,candidate_id); a=get_or_404(s,Artifact,body.artifact_id)
+    if c.status != "completed" or a.candidate_id != c.id or a.kind not in {"unity_lod0_glb","rigged_glb"} or not abs_path(a.path).is_file():
+        raise HTTPException(422,"同じ候補のリグ付きGLBを選択してください")
+    if not text_motion_status()["ready"]: raise HTTPException(409,"ローカルモデルの準備が完了していません")
+    payload={**body.model_dump(),"source_artifact_id":a.id,"source_model_path":a.path,
+             "source_sha256":hashlib.sha256(abs_path(a.path).read_bytes()).hexdigest(),"pipeline":"local-mdm-humanml-v1"}
+    j=Job(kind="text_motion",run_id=c.run_id,candidate_id=c.id,payload=json.dumps(payload));s.add(j);s.commit();return serialize(j)
 @app.post("/worker/jobs/claim",response_model=Optional[JobOut])
 def claim(kind:str,s:Session=Depends(db)):
+    # SQLite writer lock serializes selection and reservation across all GPU
+    # workers. In particular, 3D generation and text motion share one GPU.
+    s.execute(text("BEGIN IMMEDIATE"))
+    if kind in {"generate","text_motion"} and s.scalar(select(Job.id).where(Job.kind.in_(["generate","text_motion"]),Job.status.in_(["claimed","running","cancelling"]))):
+        s.rollback(); return None
     j=s.scalar(select(Job).where(Job.kind==kind,Job.status=="queued").order_by(Job.created_at))
     if not j:return None
     j.status="claimed";j.claimed_at=now();sync_run_status(s,j.run_id);s.commit();return j
 @app.post("/worker/jobs/{job_id}/start")
 def start(job_id:str,s:Session=Depends(db)):
-    j=get_or_404(s,Job,job_id);j.status="running";j.progress=0
+    s.execute(text("BEGIN IMMEDIATE"))
+    j=get_or_404(s,Job,job_id)
+    if j.kind in {"text_motion","generate"} and j.status!="claimed": raise HTTPException(409,"開始可能なジョブではありません")
+    j.status="running";j.progress=0
     if j.kind=="generate" and j.candidate_id: get_or_404(s,Candidate,j.candidate_id).status="running"
     sync_run_status(s,j.run_id);s.commit();return serialize(j)
 @app.post("/worker/jobs/{job_id}/update")
 def update(job_id:str,body:WorkerUpdate,s:Session=Depends(db)):
+    s.execute(text("BEGIN IMMEDIATE"))
     j=get_or_404(s,Job,job_id)
+    if j.kind in {"text_motion","generate"} and j.status in {"completed","failed","cancelled","cancelling"}: return serialize(j)
     if body.progress is not None:j.progress=body.progress
     if body.log:j.log+=(body.log+"\n")
     if body.error:
@@ -235,18 +276,38 @@ def update(job_id:str,body:WorkerUpdate,s:Session=Depends(db)):
     sync_run_status(s,j.run_id);s.commit();return serialize(j)
 @app.post("/worker/jobs/{job_id}/complete")
 def complete(job_id:str,result:dict,s:Session=Depends(db)):
-    j=get_or_404(s,Job,job_id); j.status="completed";j.progress=100;j.log+="completed\n"
+    s.execute(text("BEGIN IMMEDIATE"))
+    j=get_or_404(s,Job,job_id)
+    if j.status=="completed": return serialize(j)
+    if j.status in {"failed","cancelled","cancelling"}: raise HTTPException(409,"ジョブは既に終了または中止されています")
+    if j.kind=="text_motion":
+        root=DATA/"projects"/j.run_id/"text-motions"/j.candidate_id/j.id
+        expected={"text_motion_glb","text_motion_fbx","text_motion_manifest","text_motion_joints"}
+        if set(result.get("artifacts",{})) != expected: raise HTTPException(422,"モーション成果物が不足しています")
+        for path in result["artifacts"].values():
+            resolved=abs_path(path)
+            if not resolved.is_relative_to(root) or not resolved.is_file(): raise HTTPException(422,"モーション成果物の保存先が不正です")
+    j.status="completed";j.progress=100;j.log+="completed\n"
     c=get_or_404(s,Candidate,j.candidate_id) if j.candidate_id else None
     if j.kind=="generate" and c: c.status="completed";c.model_path=result.get("model_path");c.preview_path=result.get("preview_path");c.score=result.get("score")
-    if j.kind in {"export","rig","game_prepare","motion_prepare"} and c:
+    if j.kind in {"export","rig","game_prepare","motion_prepare","text_motion"} and c:
         for kind,path in result.get("artifacts",{}).items(): s.add(Artifact(candidate_id=c.id,kind=kind,path=path,metadata_json=json.dumps(result.get("metadata",{}))))
     if j.kind=="optimize" and c and result.get("model_path"): c.model_path=result["model_path"]
     sync_run_status(s,j.run_id);s.commit();return serialize(j)
 @app.post("/worker/jobs/{job_id}/cancel")
 def cancel(job_id:str,s:Session=Depends(db)):
-    j=get_or_404(s,Job,job_id);j.status="cancelled"
+    s.execute(text("BEGIN IMMEDIATE"))
+    j=get_or_404(s,Job,job_id)
+    if j.status in {"completed","failed","cancelled"}: return serialize(j)
+    j.status="cancelling" if j.kind in {"text_motion","generate"} and j.status in {"claimed","running","cancelling"} else "cancelled"
     if j.kind=="generate" and j.candidate_id: get_or_404(s,Candidate,j.candidate_id).status="cancelled"
     sync_run_status(s,j.run_id);s.commit();return serialize(j)
+@app.post("/worker/jobs/{job_id}/cancelled")
+def acknowledge_cancel(job_id:str,s:Session=Depends(db)):
+    s.execute(text("BEGIN IMMEDIATE"))
+    j=get_or_404(s,Job,job_id)
+    if j.kind not in {"text_motion","generate"} or j.status!="cancelling": raise HTTPException(409,"中止確認の対象ではありません")
+    j.status="cancelled";sync_run_status(s,j.run_id);s.commit();return serialize(j)
 @app.get("/files/{path:path}")
 def file_path(path:str):
     p=abs_path(path)

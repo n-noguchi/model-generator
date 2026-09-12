@@ -103,7 +103,9 @@ class HunyuanMultiViewBackend:
         if not runtime.is_file(): raise RuntimeError("Hunyuan3D-2 実行環境がありません。sf3d-workerイメージを再ビルドしてください。")
         request = out / "hunyuan-request.json"
         request.write_text(json.dumps({"payload": payload, "views": prepared}), encoding="utf-8")
-        process = subprocess.Popen([str(runtime), str(Path(__file__).resolve()), "--request", str(request), "--out", str(out)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        lock_fd = os.getenv("GPU_JOB_LOCK_FD", "")
+        process = subprocess.Popen([str(runtime), str(Path(__file__).resolve()), "--request", str(request), "--out", str(out)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                   pass_fds=(int(lock_fd),) if lock_fd else ())
         recent = deque(maxlen=20)
         log_path = out / "hunyuan.log"
         try:

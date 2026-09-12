@@ -335,6 +335,11 @@ progress {
   border-radius: 9px;
   overflow: hidden;
 }
+.custom-motion-form { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.custom-motion-form label { display: flex; flex-direction: column; gap: 6px; }
+.custom-motion-form textarea { width: 100%; resize: vertical; box-sizing: border-box; color: #eaf2ff; background: #0c1621; border: 1px solid #41576b; border-radius: 8px; padding: 10px; font: inherit; }
+.custom-motion-options { display: flex; flex-wrap: wrap; gap: 12px; }
+.custom-motion-options input { width: 130px; }
 .empty {
   display: grid;
   place-items: center;

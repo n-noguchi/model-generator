@@ -60,6 +60,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\download-hunyuan.ps1
 
 ## 出力と注意事項
 
+リグ付きモデルに文章で動作を付ける機能は、[ローカルText-to-Motionの手順](docs/local-text-motion.md)を参照してください。初回だけ追加モデルの取得が必要です。
+
 生成結果には最終 `mesh.glb`、形状のみの `mesh-shape.glb`、`texture.png`、`hunyuan.log`、投影診断画像が含まれます。ゲーム利用前にはメッシュ整理、LOD、リグ、スキニングなどの後工程が必要です。
 
 4方向画像間で顔、服、照明、輪郭が不一致の場合、投影境界が残ることがあります。プレビューと診断画像で確認してください。

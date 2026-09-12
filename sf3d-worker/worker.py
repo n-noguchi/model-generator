@@ -135,19 +135,29 @@ def post(path, **kwargs):
     return response
 def report_connection_error(error): print(f"API unavailable; retrying in 2 seconds: {error}",flush=True)
 def main():
+    from gpu_runtime import api, run_process, serve
+    def execute(job):
+        api(f"/worker/jobs/{job['id']}/start", {})
+        api(f"/worker/jobs/{job['id']}/update", {"progress":10,"log":"generation started"})
+        out=DATA/"projects"/job["run_id"]/"runs"/job["candidate_id"]
+        out.mkdir(parents=True,exist_ok=True)
+        job_path=out/(job["id"]+".job.json")
+        job_path.write_text(json.dumps(job))
+        run_process([sys.executable,__file__,"--job",str(job_path)],out,job,job["id"]+".log")
+        return json.loads(job_path.with_suffix(".result.json").read_text())
+    serve("generate",execute)
+
+def generate_child(job_path):
+    job=json.loads(job_path.read_text())
     backend=MockImageTo3DBackend() if os.getenv("BACKEND_MODE","mock")=="mock" else ProductionImageTo3DBackend()
-    while True:
-        try: job=post("/worker/jobs/claim?kind=generate").json()
-        except (requests.RequestException, ValueError) as e:
-            report_connection_error(e);time.sleep(2);continue
-        if not job: time.sleep(2);continue
-        try:
-            post(f"/worker/jobs/{job['id']}/start"); post(f"/worker/jobs/{job['id']}/update",json={"progress":10,"log":"generation started"})
-            out=DATA/"projects"/job["run_id"]/"runs"/job["candidate_id"]
-            def report(message): post(f"/worker/jobs/{job['id']}/update",json={"progress":20,"log":message})
-            model,preview,score=backend.generate(json.loads(job["payload"]),out,report)
-            post(f"/worker/jobs/{job['id']}/complete",json={"model_path":str(model.relative_to(DATA)).replace('\\','/'),"preview_path":str(preview.relative_to(DATA)).replace('\\','/'),"score":score})
-        except Exception as e:
-            try: post(f"/worker/jobs/{job['id']}/update",json={"error":str(e)})
-            except requests.RequestException as report_error: report_connection_error(report_error)
-if __name__=="__main__": main()
+    out=DATA/"projects"/job["run_id"]/"runs"/job["candidate_id"]
+    def report(message):
+        print(message,flush=True)
+        post(f"/worker/jobs/{job['id']}/update",json={"progress":20,"log":message})
+    model,preview,score=backend.generate(json.loads(job["payload"]),out,report)
+    result={"model_path":model.relative_to(DATA).as_posix(),"preview_path":preview.relative_to(DATA).as_posix(),"score":score}
+    job_path.with_suffix(".result.json").write_text(json.dumps(result))
+
+if __name__=="__main__":
+    if len(sys.argv)==3 and sys.argv[1]=="--job": generate_child(Path(sys.argv[2]))
+    else: main()

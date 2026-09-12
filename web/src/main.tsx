@@ -34,6 +34,7 @@ type Job = {
   status: string;
   progress: number;
   log: string;
+  payload?: string;
 };
 type Row = { id: string; status: string; created_at: string; warning?: string };
 type Run = Row & {
@@ -108,6 +109,7 @@ function Model({
   showSkeleton = false,
   pose = "rest",
   animation,
+  followMotion = false,
   onAnimationNames,
 }: {
   path: string;
@@ -116,6 +118,7 @@ function Model({
   showSkeleton?: boolean;
   pose?: string;
   animation?: { clip: string; playing: boolean; loop: boolean; speed: number; restart: number };
+  followMotion?: boolean;
   onAnimationNames?: (names: string[]) => void;
 }) {
   const gltf = useGLTF(api + "/files/" + path);
@@ -125,7 +128,30 @@ function Model({
   const skeleton = useMemo(() => showSkeleton ? new THREE.SkeletonHelper(scene) : undefined, [scene, showSkeleton]);
   const mixer = useMemo(() => new THREE.AnimationMixer(scene), [scene]);
   const actionRef = useRef<THREE.AnimationAction>();
-  useFrame((_, delta) => mixer.update(delta));
+  const displayGroup = useRef<THREE.Group>(null);
+  const rootTracking = useMemo(() => {
+    scene.updateMatrixWorld(true);
+    const hips = scene.getObjectByName("Hips");
+    return { hips, anchor: hips?.getWorldPosition(new THREE.Vector3()), current: new THREE.Vector3() };
+  }, [scene]);
+  useEffect(() => {
+    if (!followMotion) return;
+    // A skinned mesh's cached bounds do not follow its deformed vertices.
+    // Display-only recentering must not cull a visible animated character.
+    scene.traverse((object) => { if ((object as THREE.SkinnedMesh).isSkinnedMesh) object.frustumCulled = false; });
+    if (skeleton) skeleton.frustumCulled = false;
+  }, [followMotion, scene, skeleton]);
+  useFrame((_, delta) => {
+    mixer.update(delta);
+    if (followMotion && displayGroup.current && rootTracking.hips && rootTracking.anchor) {
+      scene.updateWorldMatrix(true, true);
+      rootTracking.hips.getWorldPosition(rootTracking.current);
+      // Display-only horizontal following. Keep actual vertical motion and
+      // never modify the bones/clip or the downloadable root-motion tracks.
+      displayGroup.current.position.x += rootTracking.anchor.x - rootTracking.current.x;
+      displayGroup.current.position.z += rootTracking.anchor.z - rootTracking.current.z;
+    }
+  });
   useEffect(() => onAnimationNames?.(gltf.animations.map((clip) => clip.name)), [gltf.animations, onAnimationNames]);
   useEffect(() => {
     mixer.stopAllAction();
@@ -188,7 +214,9 @@ function Model({
       }
     });
   }, [scene, mode, texture]);
-  return <><primitive object={scene} />{skeleton && <primitive object={skeleton} />}</>;
+  // SkeletonHelper already uses the root's world matrix; keep it outside the
+  // display offset group to avoid applying the following translation twice.
+  return <><group ref={displayGroup}><primitive object={scene} /></group>{skeleton && <primitive object={skeleton} />}</>;
 }
 function Camera({ preset, multiview }: { preset: string; multiview: boolean }) {
   const { camera } = useThree();
@@ -227,7 +255,7 @@ function DiagnosticCamera({ path, preset, multiview }: { path: string; preset: s
   }, [box, camera, controls, preset, multiview, size.width, size.height]);
   return null;
 }
-function Viewer({ candidate, multiview = false, modelPath, rigPreview = false, motionPreview = false, diagnostic = false, fallbackToCandidate = true, emptyMessage }: { candidate?: Candidate; multiview?: boolean; modelPath?: string; rigPreview?: boolean; motionPreview?: boolean; diagnostic?: boolean; fallbackToCandidate?: boolean; emptyMessage?: string }) {
+function Viewer({ candidate, multiview = false, modelPath, rigPreview = false, motionPreview = false, defaultLoop = true, followMotion = false, diagnostic = false, fallbackToCandidate = true, emptyMessage }: { candidate?: Candidate; multiview?: boolean; modelPath?: string; rigPreview?: boolean; motionPreview?: boolean; defaultLoop?: boolean; followMotion?: boolean; diagnostic?: boolean; fallbackToCandidate?: boolean; emptyMessage?: string }) {
   const [mode, setMode] = useState("solid"),
     [texture, setTexture] = useState(true),
     [preset, setPreset] = useState("front"),
@@ -235,7 +263,7 @@ function Viewer({ candidate, multiview = false, modelPath, rigPreview = false, m
     [animationNames, setAnimationNames] = useState<string[]>([]),
     [clip, setClip] = useState(""),
     [playing, setPlaying] = useState(true),
-    [loop, setLoop] = useState(true),
+    [loop, setLoop] = useState(defaultLoop),
     [speed, setSpeed] = useState(1),
     [restart, setRestart] = useState(0);
   const path = modelPath || (fallbackToCandidate ? candidate?.model_path : undefined);
@@ -295,12 +323,12 @@ function Viewer({ candidate, multiview = false, modelPath, rigPreview = false, m
         <Canvas gl={{ alpha: true }} style={{ background: "transparent" }}>
           <ambientLight intensity={1.5} />
           <directionalLight position={[3, 4, 3]} />
-          {!diagnostic && <Camera preset={preset} multiview={multiview} />}
+          {!diagnostic && !followMotion && <Camera preset={preset} multiview={multiview} />}
           <React.Suspense fallback={<></>}>
-            {diagnostic && <DiagnosticCamera path={path} preset={preset} multiview={multiview} />}
-            <Model path={path} mode={mode} texture={texture} showSkeleton={rigPreview} pose={pose} animation={animation} onAnimationNames={motionPreview ? setAnimationNames : undefined} />
+            {(diagnostic || followMotion) && <DiagnosticCamera path={path} preset={preset} multiview={multiview} />}
+            <Model path={path} mode={mode} texture={texture} showSkeleton={rigPreview} pose={pose} animation={animation} followMotion={followMotion} onAnimationNames={motionPreview ? setAnimationNames : undefined} />
           </React.Suspense>
-          <OrbitControls makeDefault={diagnostic} />
+          <OrbitControls makeDefault={diagnostic || followMotion} />
         </Canvas>
       </div>
     </ViewerBoundary>
@@ -482,6 +510,16 @@ function App() {
     [collision, setCollision] = useState(false),
     [height, setHeight] = useState("");
   const [unityPreviewKind, setUnityPreviewKind] = useState("unity_lod0_glb");
+  const [motionPrompt, setMotionPrompt] = useState("A person walks forward.");
+  const [motionSeconds, setMotionSeconds] = useState(4);
+  const [motionSeed, setMotionSeed] = useState(1234);
+  const [localMotionStatus, setLocalMotionStatus] = useState({ ready: false, message: "ローカルモデルを確認中…" });
+  useEffect(() => {
+    let active = true;
+    const refresh = () => void call("/text-motion/status").then(value => { if (active) setLocalMotionStatus(value); }).catch(() => { if (active) setLocalMotionStatus({ ready: false, message: "ローカルモーションワーカーに接続できません。" }); });
+    refresh(); const timer = window.setInterval(refresh, 5000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, []);
   useEffect(() => setUnityPreviewKind("unity_lod0_glb"), [selected?.id]);
   const fail = (e: unknown) =>
     setError(e instanceof Error ? e.message : "操作に失敗しました");
@@ -632,6 +670,15 @@ function App() {
     .filter((artifact): artifact is Artifact => !!artifact);
   const selectedUnityPreview = unityPreviewArtifacts.find((artifact) => artifact.kind === unityPreviewKind) || unityPreviewArtifacts[0];
   const latestMotionGlb = latestArtifacts.find((artifact) => artifact.kind === "template_motion_glb");
+  const textMotionJob = latestSelectedJobs.find(job => job.kind === "text_motion");
+  const textMotionArtifacts = latestArtifacts.filter(artifact => artifact.kind.startsWith("text_motion_"));
+  const textMotionGlb = textMotionArtifacts.find(artifact => artifact.kind === "text_motion_glb");
+  const displayedTextMotionJob = latestCompletedSelectedJobs.find(job => job.kind === "text_motion" && textMotionGlb?.path.includes(`/${job.id}/`));
+  const displayedTextMotion = useMemo(() => {
+    try { return JSON.parse(displayedTextMotionJob?.payload || "{}") as { prompt?: string; seconds?: number }; }
+    catch { return {}; }
+  }, [displayedTextMotionJob?.payload]);
+  const textMotionBusy = !!textMotionJob && ["queued", "claimed", "running", "cancelling"].includes(textMotionJob.status);
   const unityArtifacts = latestArtifacts.filter((artifact) => artifact.kind.startsWith("unity_") && !artifact.kind.includes("_attachment_"));
   const motionArtifacts = latestArtifacts.filter((artifact) => artifact.kind.startsWith("template_motion_") || artifact.kind === "motion_manifest");
   const exportArtifacts = latestArtifacts.filter((artifact) => ["glb", "fbx", "zip"].includes(artifact.kind));
@@ -1142,7 +1189,42 @@ function App() {
           )}
           {selected && (
             <section>
-              <div className="section-title"><div><p className="step">STEP 9</p><h2>汎用エクスポート</h2></div></div>
+              <div className="section-title"><div><p className="step">STEP 9</p><h2>カスタムモーション（ローカルAI）</h2></div></div>
+              <p>短い英語の動作指示から、新しいモーションを生成します。モデルはこのPCで動作します。</p>
+              <div className="process-layout">
+                <div className="custom-motion-form">
+                  <p role="status">{localMotionStatus.message}</p>
+                  <label>動作の指示（英語）<textarea value={motionPrompt} maxLength={240} rows={3} onChange={e => setMotionPrompt(e.target.value)} placeholder="A person raises both arms." /></label>
+                  <small>1つの動作を短く具体的に指定してください。日本語・長い文章・手指の細かな動作には未対応です。</small>
+                  <div className="custom-motion-options">
+                    <label>長さ（秒）<input type="number" min={2} max={8} step={.5} value={motionSeconds} onChange={e => setMotionSeconds(Number(e.target.value))} /></label>
+                    <label>シード<input type="number" min={0} max={2147483647} step={1} value={motionSeed} onChange={e => setMotionSeed(Number(e.target.value))} /></label>
+                  </div>
+                  <small>シードを変えると別の動きを生成します。2〜8秒のクリップに対応します。</small>
+                  <button disabled={loading || textMotionBusy || !localMotionStatus.ready || !(latestUnityLod0 || latestRiggedGlb) || !motionPrompt.trim() || !Number.isFinite(motionSeconds) || motionSeconds < 2 || motionSeconds > 8 || !Number.isInteger(motionSeed) || motionSeed < 0 || motionSeed > 2147483647}
+                    onClick={() => { const source = latestUnityLod0 || latestRiggedGlb; if (source) void action("/candidates/" + selected.id + "/text-motions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ artifact_id: source.id, prompt: motionPrompt, seconds: motionSeconds, seed: motionSeed }) }); }}>
+                    {textMotionBusy ? "カスタムモーションを生成中…" : "文章からモーションを生成"}
+                  </button>
+                  {!(latestUnityLod0 || latestRiggedGlb) && <p className="blocked-reason">先にリグ付きモデルまたはUnity用ゲームパッケージを作成してください。</p>}
+                  <h3>進捗</h3>
+                  <JobProgress job={textMotionJob} emptyMessage="まだカスタムモーションを生成していません。" />
+                  {textMotionBusy && <button onClick={() => void action("/worker/jobs/" + textMotionJob!.id + "/cancel", { method: "POST" })} disabled={textMotionJob?.status === "cancelling"}>生成を中止</button>}
+                  <h3>ダウンロード</h3><ArtifactLinks artifacts={textMotionArtifacts} emptyMessage="完了後、ここにGLB・FBXと生成条件を表示します。" />
+                  <p className="muted">生成後は動作を確認してください。物体との接触・足接地IKには未対応です。モデル・学習データの利用条件は商用利用前に確認が必要です。</p>
+                </div>
+                <article className="preview-card">
+                  <h3>カスタムモーションのプレビュー</h3>
+                  {displayedTextMotion.prompt && <p className="muted">表示中: {displayedTextMotion.prompt}（{displayedTextMotion.seconds}秒）</p>}
+                  <Viewer modelPath={textMotionGlb?.path} multiview={run.run.generation_mode === "multiview"} rigPreview={!!textMotionGlb} motionPreview={!!textMotionGlb} defaultLoop={false} followMotion fallbackToCandidate={false} emptyMessage="生成したカスタムモーションをここに自動表示します。" />
+                  <p className="muted">プレビューは水平方向の移動に追従します。ダウンロードには元の移動を保持します。</p>
+                  {textMotionGlb && displayedTextMotionJob?.id !== textMotionJob?.id && <p className="muted">直前に成功したモーションを表示しています。</p>}
+                </article>
+              </div>
+            </section>
+          )}
+          {selected && (
+            <section>
+              <div className="section-title"><div><p className="step">STEP 10</p><h2>汎用エクスポート</h2></div></div>
               <p className="muted">選択中候補をGLB / FBX / ZIPとして書き出します。</p>
                 <button
                   onClick={() =>

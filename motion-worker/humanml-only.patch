@@ -1,0 +1,28 @@
+diff --git a/model/mdm.py b/model/mdm.py
+--- a/model/mdm.py
++++ b/model/mdm.py
+@@ -3,7 +3,6 @@
+ import torch.nn as nn
+ import torch.nn.functional as F
+ import clip
+-from model.rotation2xyz import Rotation2xyz
+ from model.BERT.BERT_encoder import load_bert
+ from utils.misc import WeightedSum
+ 
+@@ -135,1 +134,5 @@
+-        self.rot2xyz = Rotation2xyz(device='cpu', dataset=self.dataset)
++        self.rot2xyz = None
++        if self.data_rep != 'hml_vec':
++            from model.rotation2xyz import Rotation2xyz
++            self.rot2xyz = Rotation2xyz(device='cpu', dataset=self.dataset)
++
+@@ -288,1 +291,3 @@
+-        self.rot2xyz.smpl_model._apply(fn)
++        if self.rot2xyz is not None:
++            self.rot2xyz.smpl_model._apply(fn)
++        return self
+@@ -293,1 +298,3 @@
+-        self.rot2xyz.smpl_model.train(*args, **kwargs)
++        if self.rot2xyz is not None:
++            self.rot2xyz.smpl_model.train(*args, **kwargs)
++        return self
